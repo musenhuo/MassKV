@@ -1,13 +1,7 @@
 /**
  * @file manifest.h
  * @author your name (you@domain.com)
- * @brief a persistent data structure on PM to record the meta data of psts on each level.
- *        Manifest is used to recover Version (including all Index) after crash.
- *
- *      On PM, Manifest occupies a separate address space and allocates this space to metadata for each level.
- *      | SuperMeta | L0Meta:[meta1 meta2 meta3 ...] [padding] | L1Meta:[meta1 meta2 meta3 ...] [padding] | L2Meta:[meta1 meta2 meta3 ...]
- *      | 32B | 32B * MAX_L0_TREE_NUM * MAX_MEMTABLE_ENTRIES/1024 =51200000 | 10 * SIZEOF(L0Meta) |
- *
+ * @brief 
  *
  * @version 0.1
  * @date 2022-10-26
@@ -22,9 +16,11 @@
 #define L1MetaSize 512000000
 // Each log group can cotain MAX_USER_THREAD_NUM * 8 log segments, which have an 4-byte id
 #define OpLogSize (4 * MAX_MEMTABLE_NUM * MAX_USER_THREAD_NUM * 32)
-#define ManifestSize (32 + L0MetaSize + L1MetaSize + OpLogSize)
+#define L1HybridStateSize (64 * 1024 * 1024)
+#define ManifestSize (4096 + L0MetaSize + L1MetaSize + OpLogSize + L1HybridStateSize)
 
 class Version;
+class SegmentAllocator;
 struct ManifestSuperMeta
 {
     uint32_t l0_min_valid_seq_no = 0;
@@ -36,21 +32,30 @@ struct ManifestSuperMeta
         uint64_t is_valid : 1;
         uint64_t length : 63;
     } flush_log;
+    struct L1HybridState
+    {
+        uint64_t is_valid : 1;
+        uint64_t length : 47;
+        uint64_t seq_no : 16;
+    } l1_hybrid_state;
+    char a[4056];
 };
 class Manifest
 {
 private:
-    const char *start_;
-    const char *l0_start_;
-    const char *l1_start_;
-    const char *flush_log_start_;
+    int fd;
+    off_t  l0_start_;
+    off_t  l1_start_;
+    off_t  flush_log_start_;
+    off_t  l1_hybrid_state_start_;
+    off_t end_;
     std::queue<int> l0_freelist_;
     std::queue<int> l1_freelist_;
-    ManifestSuperMeta *super_;
-    const char *end_;
+    ManifestSuperMeta super_;
+    char *buf_;
 
 public:
-    Manifest(char *pmem_addr, bool recover);
+    Manifest(int fd, bool recover);
     ~Manifest();
     /**
      * @brief persist new pst in manifest
@@ -77,10 +82,14 @@ public:
 
     bool GetFlushLog(std::vector<uint64_t>& deleted_log_segment_ids);
 
+    bool PersistL1HybridState(const std::vector<uint8_t>& bytes, uint32_t current_l1_seq_no);
+    bool LoadL1HybridState(uint32_t expected_l1_seq_no, std::vector<uint8_t>& bytes_out);
+    void ClearL1HybridState();
+
     Version *RecoverVersion(Version *source,SegmentAllocator* allocator);
 
 	void PrintL1Info();
 
 private:
-    inline const char *GetAddr(int level, int idx);
+    inline const off_t Getoff(int idx, int level);
 };

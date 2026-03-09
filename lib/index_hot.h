@@ -4,6 +4,12 @@
 #include "hot/rowex/HOTRowex.hpp"
 #include "idx/contenthelpers/IdentityKeyExtractor.hpp"
 
+// HOTIndex currently only supports 8B keys
+// TODO: Add 16B key support for HOT index
+#if defined(FLOWKV_KEY16) && (defined(HOT_MEMTABLE) || defined(HOT_L1) || defined(HOT_L0))
+#error "HOTIndex does not yet support FLOWKV_KEY16. Please use MasstreeIndex/HMasstreeIndex instead, or disable FLOWKV_KEY16."
+#endif
+
 typedef struct IntKeyVal
 {
     uint64_t key;
@@ -117,7 +123,7 @@ public:
             }
         }
     }
-    virtual void Scan2(const KeyType key, int cnt, std::vector<uint64_t> &kvec,
+    virtual void Scan2(const KeyType key, int cnt, std::vector<KeyType> &kvec,
                       std::vector<ValueType> &vec) override
     {
         auto iter = Seek(__bswap_64(key));
@@ -134,7 +140,7 @@ public:
         }
     }
 
-    virtual void ScanByRange(const KeyType key, const KeyType end, std::vector<uint64_t> &kvec,
+    virtual void ScanByRange(const KeyType key, const KeyType end, std::vector<KeyType> &kvec,
                       std::vector<ValueType> &vec) override
     {
         auto iter = Seek(__bswap_64(key));

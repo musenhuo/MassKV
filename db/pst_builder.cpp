@@ -1,16 +1,9 @@
 #include "pst_builder.h"
 
-// TODO： this is only for pm pst. support SSD data_writer_
-PSTBuilder::PSTBuilder(SegmentAllocator *segment_allocator, bool use_ssd_for_data) : pindex_writer_(segment_allocator)
+
+PSTBuilder::PSTBuilder(SegmentAllocator *segment_allocator) 
 {
-    if (use_ssd_for_data)
-    {
-        data_writer_ = new DataBlockWriterSsd(segment_allocator);
-    }
-    else
-    {
-        data_writer_ = new DataBlockWriterPm(segment_allocator);
-    }
+    data_writer_ = new DataBlockWriter(segment_allocator);
 }
 
 PSTBuilder::~PSTBuilder()
@@ -18,7 +11,7 @@ PSTBuilder::~PSTBuilder()
     PersistCheckpoint();
     if (data_writer_)
     {
-        delete (DataBlockWriterPm *)data_writer_;
+        delete (DataBlockWriter *)data_writer_;
     }
 }
 
@@ -32,32 +25,15 @@ PSTBuilder::~PSTBuilder()
  */
 bool PSTBuilder::AddEntry(Slice key, Slice value)
 {
-    if (datablock_metas_.size() >= max_datablock_num)
-    {
-        return false;
-    }
+    //zwt todo
     auto ret = data_writer_->AddEntry(key, value);
     if (!ret)
     {
-        uint64_t min_key_in_datablock = data_writer_->GetCurrentMinKey();
-        uint64_t datablock_addr = data_writer_->Flush();
-
-        
-        meta_.datablock_num_++;
-        datablock_metas_.push_back(std::make_pair(min_key_in_datablock, datablock_addr));
-        if (datablock_metas_.size() >= max_datablock_num)
-        {
-            return false;
-        }
-        auto ret2 = data_writer_->AddEntry(key, value);
-        if (!ret2)
-        {
-            ERROR_EXIT("can't add entry to data block writer");
-        }
+        return false;
     }
-    if (meta_.min_key_ == MAX_UINT64)
-        meta_.min_key_ = key.ToUint64();
-    meta_.max_key_ = key.ToUint64();
+    // if (meta_.min_key_ == MAX_UINT64)
+    //     meta_.min_key_ = key.ToUint64();
+    // meta_.max_key_ = key.ToUint64();
     meta_.entry_num_++;
     return true;
 }
@@ -65,24 +41,21 @@ bool PSTBuilder::AddEntry(Slice key, Slice value)
 // build a indexblock, then flush all of the datablocks and the indexblock
 PSTMeta PSTBuilder::Flush()
 {
-	if(datablock_metas_.empty() && data_writer_->Empty())return PSTMeta::InvalidTable();
-    // flushed datablocks
-    for (auto &datablock : datablock_metas_)
-    {
-        pindex_writer_.AddEntry(Slice(&datablock.first), datablock.second);
-    }
-    // maybe there is a current datablock
-    uint64_t min_key_in_datablock = data_writer_->GetCurrentMinKey();
-    uint64_t datablock_addr = data_writer_->Flush();
-    if (datablock_addr != INVALID_PTR)
-    {
-        pindex_writer_.AddEntry(Slice(&min_key_in_datablock), datablock_addr);
-        meta_.datablock_num_++;
-    }
-
-    // flush pindex
-    meta_.indexblock_ptr_ = pindex_writer_.Flush();
-
+	if(data_writer_->Empty())return PSTMeta::InvalidTable();
+    meta_.datablock_ptr_ = data_writer_->Flush();
+    
+#if defined(FLOWKV_KEY16)
+    Key16 max_k = data_writer_->GetKey(meta_.entry_num_-1);
+    meta_.max_key_hi = max_k.hi;
+    meta_.max_key_lo = max_k.lo;
+    Key16 min_k = data_writer_->GetKey(0);
+    meta_.min_key_hi = min_k.hi;
+    meta_.min_key_lo = min_k.lo;
+#else
+    meta_.max_key_ = data_writer_->GetKey(meta_.entry_num_-1);
+    meta_.min_key_ = data_writer_->GetKey(0);
+#endif
+    
     PSTMeta ret = meta_;
     Clear();
     return ret;
@@ -90,14 +63,25 @@ PSTMeta PSTBuilder::Flush()
 
 void PSTBuilder::Clear()
 {
+#if defined(FLOWKV_KEY16)
     meta_ =
         {
-            .indexblock_ptr_ = 0,
+            .datablock_ptr_ = 0,
+            .max_key_hi = 0,
+            .max_key_lo = 0,
+            .min_key_hi = MAX_UINT64,
+            .min_key_lo = MAX_UINT64,
+            .seq_no_ = 0,
+            .entry_num_ = 0};
+#else
+    meta_ =
+        {
+            .datablock_ptr_ = 0,
             .max_key_ = 0,
             .min_key_ = MAX_UINT64,
-            .entry_num_ = 0,
-            .datablock_num_ = 0};
-    datablock_metas_.clear();
+            .seq_no_ = 0,
+            .entry_num_ = 0};
+#endif
 }
 
 /**
@@ -106,6 +90,5 @@ void PSTBuilder::Clear()
  */
 void PSTBuilder::PersistCheckpoint()
 {
-    pindex_writer_.PersistCheckpoint();
     data_writer_->PersistCheckpoint();
 }

@@ -24,8 +24,13 @@ private:
 	std::vector<TaggedPstMeta> partition_outputs_[RANGE_PARTITION_NUM];
 
     // temp variables
-    size_t min_key_ = MAX_UINT64;
-    size_t max_key_ = 0;
+    #if defined(FLOWKV_KEY16)
+    KeyType min_key_{MAX_UINT64, MAX_UINT64};
+    KeyType max_key_{0, 0};
+    #else
+    KeyType min_key_ = MAX_UINT64;
+    KeyType max_key_ = 0;
+    #endif
 
 	//for sub compaction
 	PartitionInfo *partition_info_;
@@ -44,7 +49,7 @@ public:
      */
     size_t PickCompaction();
     /**
-     * @brief merge sorting inputs, writing all output psts to pm 
+     * @brief merge sorting inputs, writing all output psts to ssd
      *          currently, we persist manifests of outputs, but not persist data (for consistency check when recovery)
      * 
      */

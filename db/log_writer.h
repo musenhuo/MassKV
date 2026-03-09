@@ -17,7 +17,9 @@ public:
     ~LogWriter();
     uint64_t WriteLogPut(Slice key, Slice value, LSN lsn);
     uint64_t WriteLogDelete(Slice key, LSN lsn);
+    size_t ReadBufferedValue(const Slice &key, ValuePtr ptr, char* output_buffer);
     void SwitchToNewSegment(int log_segment_group_id);
+    void PersistNowSegment();
 
 private:
     template <typename T>

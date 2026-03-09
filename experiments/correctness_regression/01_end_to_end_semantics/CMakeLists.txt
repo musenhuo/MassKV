@@ -1,0 +1,7 @@
+add_executable(correctness_e2e_semantics_stress
+    ${PROJECT_SOURCE_DIR}/experiments/correctness_regression/01_end_to_end_semantics/correctness_e2e_semantics_stress.cpp)
+
+target_link_libraries(correctness_e2e_semantics_stress flowkv)
+
+add_test(NAME correctness_e2e_semantics_stress
+    COMMAND correctness_e2e_semantics_stress)

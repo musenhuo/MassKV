@@ -1,5 +1,5 @@
 #include "slice.h"
-
+#include <iostream>
 /**
  * @brief
  *
@@ -45,16 +45,22 @@ int binarysearch(char *arr, int len, T key, const int record_size)
 
 int binarysearch(char *arr, int len, Slice key, const int record_size)
 {
-
+    assert(arr != nullptr && key.data() != nullptr && record_size > 0);
+    std::cout<<"1"<<std::endl; 
     int left = 0;        //数组的左侧下标
     int right = len - 1; //数组的右侧下标
     int mid = 0;
     int ret;
     while (left <= right)
     {
-        mid = (left + right) / 2;                          //定义中间位的下标
+        
+        mid = (left + right) / 2;                         //定义中间位的下标
+        assert(mid * record_size < len * record_size); 
+        std::cout<<"2"<<std::endl; 
+        
         Slice mid_key = Slice(arr + mid * record_size, 8); //定义中间值的基准值
-        ret = mid_key.compare(key);
+        ret = memcmp(arr + mid * record_size,key.data(),8);
+        std::cout<<ret<<std::endl; 
         if (ret == 0) //如果基准值正好等于要查找的值，则自动返回要找的位置
         {
             return mid;

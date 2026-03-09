@@ -190,8 +190,8 @@ int scanstackelt<P>::find_initial(H& helper, key_type& ka, bool emit_equal,
     n_ = root_->reach_leaf(ka, v_, ti);
 
  retry_node:
-    if (v_.deleted())
-        goto retry_root;
+    // if (v_.deleted())
+    //     goto retry_root;
     n_->prefetch();
     perm_ = n_->permutation();
 
@@ -207,11 +207,11 @@ int scanstackelt<P>::find_initial(H& helper, key_type& ka, bool emit_equal,
             suffix.s = suffixbuf;
         }
     }
-    if (n_->has_changed(v_)) {
-        ti.mark(tc_leaf_retry);
-        n_ = n_->advance_to_key(ka, v_, ti);
-        goto retry_node;
-    }
+    // if (n_->has_changed(v_)) {
+    //     ti.mark(tc_leaf_retry);
+    //     n_ = n_->advance_to_key(ka, v_, ti);
+    //     goto retry_node;
+    // }
 
     ki_ = kx.i;
     if (kx.p >= 0) {
@@ -240,8 +240,8 @@ int scanstackelt<P>::find_retry(H& helper, key_type& ka, threadinfo& ti)
 {
  retry:
     n_ = root_->reach_leaf(ka, v_, ti);
-    if (v_.deleted())
-        goto retry;
+    // if (v_.deleted())
+    //     goto retry;
 
     n_->prefetch();
     perm_ = n_->permutation();
@@ -254,8 +254,8 @@ int scanstackelt<P>::find_next(H &helper, key_type &ka, leafvalue_type &entry)
 {
     int kp;
 
-    if (v_.deleted())
-        return scan_retry;
+    // if (v_.deleted())
+    //     return scan_retry;
 
  retry_entry:
     kp = this->kp();
@@ -269,9 +269,9 @@ int scanstackelt<P>::find_next(H &helper, key_type &ka, leafvalue_type &entry)
         if (n_->keylenx_has_ksuf(keylenx))
             keylen = ka.assign_store_suffix(n_->ksuf(kp));
 
-        if (n_->has_changed(v_))
-            goto changed;
-        else if (helper.is_duplicate(ka, ikey, keylenx)) {
+        // if (n_->has_changed(v_))
+        //     goto changed;
+        if (helper.is_duplicate(ka, ikey, keylenx)) {
             ki_ = helper.next(ki_);
             goto retry_entry;
         }
@@ -289,15 +289,12 @@ int scanstackelt<P>::find_next(H &helper, key_type &ka, leafvalue_type &entry)
             return scan_emit;
         }
     }
-
-    if (!n_->has_changed(v_)) {
-        n_ = helper.advance(n_, ka);
-        if (!n_) {
-            helper.mark_key_complete();
-            return scan_up;
-        }
-        n_->prefetch();
+    n_ = helper.advance(n_, ka);
+    if (!n_) {
+        helper.mark_key_complete();
+        return scan_up;
     }
+    n_->prefetch();
 
  changed:
     v_ = helper.stable(n_, ka);

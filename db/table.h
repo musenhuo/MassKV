@@ -6,18 +6,40 @@
  */
 struct PSTMeta
 {
-    uint64_t indexblock_ptr_ = 0;
+    uint64_t datablock_ptr_ = 0;
+#if defined(FLOWKV_KEY16)
+    uint64_t max_key_hi = 0;
+    uint64_t max_key_lo = 0;
+    uint64_t min_key_hi = MAX_UINT64;
+    uint64_t min_key_lo = MAX_UINT64;
+#else
     uint64_t max_key_ = 0;
     uint64_t min_key_ = MAX_UINT64;
+#endif
     uint32_t seq_no_ = 0;
     uint16_t entry_num_ = 0;
-    uint16_t datablock_num_ = 0;
-
     static PSTMeta InvalidTable() { return PSTMeta(); }
-    bool Valid()
+    bool Valid() const
     {
-        // DEBUG("indexblock_ptr_=%lu,get_pure_indexblock_ptr=%lu",indexblock_ptr_,get_pure_indexblock_ptr());
-        return indexblock_ptr_ != 0;
+        return datablock_ptr_ != 0;
+    }
+
+    KeyType MinKey() const
+    {
+#if defined(FLOWKV_KEY16)
+        return Key16{min_key_hi, min_key_lo};
+#else
+        return min_key_;
+#endif
+    }
+
+    KeyType MaxKey() const
+    {
+#if defined(FLOWKV_KEY16)
+        return Key16{max_key_hi, max_key_lo};
+#else
+        return max_key_;
+#endif
     }
 };
 
@@ -28,7 +50,7 @@ struct TaggedPstMeta
     // optional information. maybe lost after recovery
     size_t level;
     size_t manifest_position;
-    bool Valid()
+    bool Valid() const
     {
         return meta.Valid();
     }

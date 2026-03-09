@@ -1,7 +1,7 @@
 #pragma once
 
-#include "util/debug_helper.h"
-#include "util/timer.h"
+#include "debug_helper.h"
+#include "timer.h"
 
 #include <atomic>
 #include <string>

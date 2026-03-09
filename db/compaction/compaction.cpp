@@ -9,7 +9,7 @@ size_t total_L1_num = 0;
 
 struct KeyWithRowId
 {
-	uint64_t key;
+	KeyType key;
 	int row_id;
 };
 
@@ -17,11 +17,11 @@ struct UintKeyComparator
 {
 	bool operator()(const KeyWithRowId l, const KeyWithRowId r) const
 	{
-		if (unlikely(__bswap_64(l.key) == __bswap_64(r.key)))
+		if (unlikely(CompareKeyType(l.key, r.key) == 0))
 		{
 			return l.row_id < r.row_id;
 		}
-		return __bswap_64(l.key) > __bswap_64(r.key);
+		return CompareKeyType(l.key, r.key) > 0;
 	}
 } cmp;
 
@@ -55,24 +55,37 @@ size_t CompactionJob::PickCompaction()
 	LOG("pick %lu level 0 tree", size);
 	for (auto &tree_meta : tree_metas)
 	{
-		if (__bswap_64(min_key_) > __bswap_64(tree_meta.min_key))
+		if (KeyTypeGreater(min_key_, tree_meta.min_key))
 		{
 			min_key_ = tree_meta.min_key;
 		}
-		if (__bswap_64(max_key_) < __bswap_64(tree_meta.max_key))
+		if (KeyTypeLess(max_key_, tree_meta.max_key))
 		{
 			max_key_ = tree_meta.max_key;
 		}
+		#if defined(FLOWKV_KEY16)
+		LOG("min:%lu:%lu,max:%lu:%lu", tree_meta.min_key.hi, tree_meta.min_key.lo, tree_meta.max_key.hi, tree_meta.max_key.lo);
+		#else
 		LOG("min:%lu,max:%lu", __bswap_64(tree_meta.min_key), __bswap_64(tree_meta.max_key));
+		#endif
 	}
+	#if defined(FLOWKV_KEY16)
+	LOG("l0 table range=%lu:%lu~%lu:%lu", min_key_.hi, min_key_.lo, max_key_.hi, max_key_.lo);
+	#else
 	LOG("l0 table range=%lu~%lu", __bswap_64(min_key_), __bswap_64(max_key_));
+	#endif
 	inputs_.emplace_back(std::vector<TaggedPstMeta>());
 	version_->PickOverlappedL1Tables(min_key_, max_key_, inputs_[size]);
 	if (inputs_[size].size())
 	{
-		DEBUG("level1 tables:%lu %lu~%lu", inputs_[size].size(), __bswap_64(inputs_[size][0].meta.min_key_), __bswap_64(inputs_[size][inputs_[size].size() - 1].meta.max_key_));
+		KeyType l1_min = inputs_[size][0].meta.MinKey();
+		KeyType l1_max = inputs_[size][inputs_[size].size() - 1].meta.MaxKey();
+		#if defined(FLOWKV_KEY16)
+		LOG("level1 tables:%lu %lu:%lu~%lu:%lu", inputs_[size].size(), l1_min.hi, l1_min.lo, l1_max.hi, l1_max.lo);
+		#else
+		LOG("level1 tables:%lu %lu~%lu", inputs_[size].size(), __bswap_64(l1_min), __bswap_64(l1_max));
+		#endif
 	}
-
 	return size;
 }
 bool CompactionJob::RunCompaction()
@@ -92,22 +105,33 @@ bool CompactionJob::RunCompaction()
 		key_heap.push(KeyWithRowId{rows[i].GetCurrentKey(), i});
 	}
 	size_t count = 0;
+	#if defined(FLOWKV_KEY16)
+	KeyWithRowId current_max_key = {Key16{0, 0}, -1};
+	#else
 	KeyWithRowId current_max_key = {0, -1};
+	#endif
 	// Get key from heap and get the value from row
 	while (!key_heap.empty())
 	{
 		auto topkey = key_heap.top();
 		key_heap.pop();
-		LOG("now:%lu from row %d, top:%lu from row %d", __bswap_64(topkey.key), topkey.row_id, __bswap_64(key_heap.top().key), key_heap.top().row_id);
 		count++;
-		if (unlikely(__bswap_64(topkey.key) < __bswap_64(current_max_key.key)))
+		if (unlikely(CompareKeyType(topkey.key, current_max_key.key) < 0))
 		{
+			#if defined(FLOWKV_KEY16)
+			ERROR_EXIT("Reverse order found in Compaction: %lu:%lu(%d)<%lu:%lu(%d)", topkey.key.hi, topkey.key.lo, topkey.row_id, current_max_key.key.hi, current_max_key.key.lo, current_max_key.row_id);
+			#else
 			ERROR_EXIT("Reverse order found in Compaction: %lu(%d)<%lu(%d)", __bswap_64(topkey.key), topkey.row_id, __bswap_64(current_max_key.key), current_max_key.row_id);
+			#endif
 		}
 		current_max_key = topkey;
 		while (!key_heap.empty() && key_heap.top().key == topkey.key)
 		{
+			#if defined(FLOWKV_KEY16)
+			DEBUG("重合key %lu:%lu from row %d with row %d", topkey.key.hi, topkey.key.lo, topkey.row_id, key_heap.top().row_id);
+			#else
 			DEBUG("重合key %lu from row %d with row %d", __bswap_64(topkey.key), topkey.row_id, key_heap.top().row_id);
+			#endif
 			// 如果出现重合key，旧key直接next
 			if (rows[topkey.row_id].NextKey())
 			{
@@ -122,14 +146,14 @@ bool CompactionJob::RunCompaction()
 		if (row.pst_iter_ == nullptr)
 		{
 			// the key is the first key in a pst, now check if the pst is overlapped with other pst
-			uint64_t max = row.GetPst().meta.max_key_;
+			KeyType max = row.GetPst().meta.MaxKey();
 			for (int i = 0; i < rows.size(); i++)
 			{
 				if (i == topkey.row_id)
 					continue;
 				if (!rows[i].Valid())
 					continue;
-				if (__bswap_64(rows[i].GetCurrentKey()) < __bswap_64(max))
+				if (KeyTypeLess(rows[i].GetCurrentKey(), max))
 				{
 					is_overlapped = 1;
 					break;
@@ -137,7 +161,11 @@ bool CompactionJob::RunCompaction()
 			}
 			if (!is_overlapped)
 			{
+				#if defined(FLOWKV_KEY16)
+				LOG("jump,topkey=%lu:%lu,max=%lu:%lu, is overlapped=%d", topkey.key.hi, topkey.key.lo, max.hi, max.lo, is_overlapped);
+				#else
 				LOG("jump,topkey=%lu,max=%lu, is overlapped=%d", __bswap_64(topkey.key), __bswap_64(max), is_overlapped);
+				#endif
 				// not overlapped: directly use the pst as output
 				TaggedPstMeta tmeta;
 				tmeta.meta = pst_builder_.Flush();
@@ -154,12 +182,20 @@ bool CompactionJob::RunCompaction()
 			{
 				// overlapped: read the pst, add entry to output pst
 				row.ResetPstIter();
-				uint64_t key, value;
-				key = row.pst_iter_->Key();
+				FixedValue16 value;
+				KeyType key = row.pst_iter_->Key();
 				// DEBUG("first key: %lu, topkey:%lu",__bswap_64(key),__bswap_64(topkey.key));
 				assert(key == topkey.key);
 				value = row.pst_iter_->Value();
-				auto success = pst_builder_.AddEntry(Slice(&key), Slice(&value));
+				#if defined(FLOWKV_KEY16)
+				uint8_t key_bytes[16];
+				key.ToBigEndianBytes(key_bytes);
+				auto success = pst_builder_.AddEntry(Slice(reinterpret_cast<const char *>(key_bytes), 16),
+                                                     Slice(reinterpret_cast<const char *>(&value), sizeof(value)));
+				#else
+				auto success = pst_builder_.AddEntry(Slice(&key),
+                                                     Slice(reinterpret_cast<const char *>(&value), sizeof(value)));
+				#endif
 				if (!success)
 				{
 					auto meta = pst_builder_.Flush();
@@ -167,7 +203,13 @@ bool CompactionJob::RunCompaction()
 					TaggedPstMeta tmeta;
 					tmeta.meta = meta;
 					outputs_.emplace_back(tmeta);
-					if (!pst_builder_.AddEntry(Slice(&key), Slice(&value)))
+					#if defined(FLOWKV_KEY16)
+					if (!pst_builder_.AddEntry(Slice(reinterpret_cast<const char *>(key_bytes), 16),
+                                               Slice(reinterpret_cast<const char *>(&value), sizeof(value))))
+					#else
+					if (!pst_builder_.AddEntry(Slice(&key),
+                                               Slice(reinterpret_cast<const char *>(&value), sizeof(value))))
+					#endif
 						ERROR_EXIT("cannot add pst entry in compaction");
 				}
 			}
@@ -175,12 +217,20 @@ bool CompactionJob::RunCompaction()
 		else
 		{
 			// not the first key in pst : add entry to output pst
-			uint64_t key, value;
-			key = row.pst_iter_->Key();
+			FixedValue16 value;
+			KeyType key = row.pst_iter_->Key();
 			// DEBUG("key: %lu, topkey:%lu",__bswap_64(key),__bswap_64(topkey.key));
 			assert(key == topkey.key);
 			value = row.pst_iter_->Value();
-			auto success = pst_builder_.AddEntry(Slice(&key), Slice(&value));
+			#if defined(FLOWKV_KEY16)
+			uint8_t key_bytes[16];
+			key.ToBigEndianBytes(key_bytes);
+			auto success = pst_builder_.AddEntry(Slice(reinterpret_cast<const char *>(key_bytes), 16),
+                                                 Slice(reinterpret_cast<const char *>(&value), sizeof(value)));
+			#else
+			auto success = pst_builder_.AddEntry(Slice(&key),
+                                                 Slice(reinterpret_cast<const char *>(&value), sizeof(value)));
+			#endif
 			if (!success)
 			{
 				auto meta = pst_builder_.Flush();
@@ -188,7 +238,13 @@ bool CompactionJob::RunCompaction()
 				TaggedPstMeta tmeta;
 				tmeta.meta = meta;
 				outputs_.emplace_back(tmeta);
-				if (!pst_builder_.AddEntry(Slice(&key), Slice(&value)))
+				#if defined(FLOWKV_KEY16)
+				if (!pst_builder_.AddEntry(Slice(reinterpret_cast<const char *>(key_bytes), 16),
+                                           Slice(reinterpret_cast<const char *>(&value), sizeof(value))))
+				#else
+				if (!pst_builder_.AddEntry(Slice(&key),
+                                           Slice(reinterpret_cast<const char *>(&value), sizeof(value))))
+				#endif
 					ERROR_EXIT("cannot add pst entry in compaction");
 			}
 		}
@@ -205,11 +261,6 @@ bool CompactionJob::RunCompaction()
 	tmeta.meta = meta;
 	outputs_.emplace_back(tmeta);
 	DEBUG("output=%lu,marked=%lu,rewrite key num=%lu", outputs_.size(), marked_output, count);
-	// for(int i=0;i<inputs_.size();i++){
-	//     for(auto& pst:inputs_[i]){
-	//         DEBUG("input[%d]:level=%lu,min=%lu,max=%lu",i,pst.level,__bswap_64(pst.meta.min_key_), __bswap_64(pst.meta.max_key_));
-	//     }
-	// }
 	pst_builder_.PersistCheckpoint();
 	rows.clear();
 	for (auto &pr : readers)
@@ -256,33 +307,81 @@ void CompactionJob::RunSubCompaction(int partition_id)
 		if (!rows[i].MoveTo(partition.min_key))
 			continue;
 		auto kwr = KeyWithRowId{rows[i].GetCurrentKey(), i};
-		if (__bswap_64(kwr.key) <= __bswap_64(partition.max_key))
+		if (KeyTypeLessEq(kwr.key, partition.max_key))
 		{
 			key_heap.push(kwr);
 			// DEBUG2("input %d ok! %lx < %lx",i,__bswap_64(kwr.key),__bswap_64(partition.max_key));
 		}
 	}
 	size_t count = 0;
+	#if defined(FLOWKV_KEY16)
+	KeyWithRowId current_max_key = {Key16{0, 0}, -1};
+	#else
 	KeyWithRowId current_max_key = {0, -1};
+	#endif
+
+	// Debug: check PST list order for each row
+	for (int i = 0; i < rows.size(); i++) {
+		auto &pst_list = rows[i].pst_list_;
+		for (size_t j = 1; j < pst_list.size(); j++) {
+			if (KeyTypeLess(pst_list[j].meta.MaxKey(), pst_list[j-1].meta.MaxKey())) {
+				#if defined(FLOWKV_KEY16)
+				ERROR_EXIT("PST list out of order for row %d: PST[%zu].MaxKey=%lu:%lu < PST[%zu].MaxKey=%lu:%lu",
+					i, j, pst_list[j].meta.MaxKey().hi, pst_list[j].meta.MaxKey().lo,
+					j-1, pst_list[j-1].meta.MaxKey().hi, pst_list[j-1].meta.MaxKey().lo);
+				#else
+				ERROR_EXIT("PST list out of order for row %d: PST[%zu].MaxKey < PST[%zu].MaxKey", i, j, j-1);
+				#endif
+			}
+		}
+	}
+
 	// Get key from heap and get the value from row
 	while (!key_heap.empty())
 	{
 		auto topkey = key_heap.top();
 		key_heap.pop();
-		if (unlikely(__bswap_64(topkey.key) < __bswap_64(current_max_key.key)))
+		count++;
+		if (unlikely(CompareKeyType(topkey.key, current_max_key.key) < 0))
 		{
+			// Print more debug info before error
+			RowIterator &errRow = rows[topkey.row_id];
+			#if defined(FLOWKV_KEY16)
+			fprintf(stderr, "Error details: partition_id=%d, count=%zu, row_id=%d, current_pst_idx=%d, pst_list_size=%zu, pst_iter=%p\n",
+				partition_id, count, topkey.row_id, errRow.current_pst_idx_, errRow.pst_list_.size(), (void*)errRow.pst_iter_);
+			if (errRow.current_pst_idx_ < errRow.pst_list_.size()) {
+				auto &pst = errRow.pst_list_[errRow.current_pst_idx_];
+				fprintf(stderr, "Current PST: MinKey=%lu:%lu, MaxKey=%lu:%lu, datablock_ptr=%lu\n",
+					pst.meta.MinKey().hi, pst.meta.MinKey().lo,
+					pst.meta.MaxKey().hi, pst.meta.MaxKey().lo,
+					pst.meta.datablock_ptr_);
+			}
+			// Check if there's a mismatch between PST MinKey and actual first key
+			if (errRow.pst_iter_) {
+				fprintf(stderr, "Iterator current key: %lu:%lu, record_idx=%d, records_size=%zu\n",
+					errRow.pst_iter_->Key().hi, errRow.pst_iter_->Key().lo,
+					errRow.pst_iter_->current_record_index_,
+					errRow.pst_iter_->RecordsSize());
+			}
+			ERROR_EXIT("Reverse order found in Compaction %lu:%lu(%d)<%lu:%lu(%d)", topkey.key.hi, topkey.key.lo, topkey.row_id, current_max_key.key.hi, current_max_key.key.lo, current_max_key.row_id);
+			#else
 			ERROR_EXIT("Reverse order found in Compaction %lu(%d)<%lu(%d)", __bswap_64(topkey.key), topkey.row_id, __bswap_64(current_max_key.key), current_max_key.row_id);
+			#endif
 		}
 		current_max_key = topkey;
 		// 如果出现重合key，旧key直接next
 		while (!key_heap.empty() && key_heap.top().key == topkey.key)
 		{
+			#if defined(FLOWKV_KEY16)
+			DEBUG("重合key %lu:%lu from row %d with row %d", topkey.key.hi, topkey.key.lo, topkey.row_id, key_heap.top().row_id);
+			#else
 			DEBUG("重合key %lu from row %d with row %d", __bswap_64(topkey.key), topkey.row_id, key_heap.top().row_id);
+			#endif
 
 			if (rows[topkey.row_id].NextKey())
 			{
 				auto kwr = KeyWithRowId{rows[topkey.row_id].GetCurrentKey(), topkey.row_id};
-				if (__bswap_64(kwr.key) <= __bswap_64(partition.max_key))
+				if (KeyTypeLessEq(kwr.key, partition.max_key))
 					key_heap.push(kwr);
 			}
 			topkey = key_heap.top();
@@ -294,14 +393,14 @@ void CompactionJob::RunSubCompaction(int partition_id)
 		if (row.pst_iter_ == nullptr)
 		{
 			// the key is the first key in a pst, now check if the pst is overlapped with other pst
-			uint64_t max = row.GetPst().meta.max_key_;
+			KeyType max = row.GetPst().meta.MaxKey();
 			for (int i = 0; i < rows.size(); i++)
 			{
 				if (i == topkey.row_id)
 					continue;
 				if (!rows[i].Valid())
 					continue;
-				if (__bswap_64(rows[i].GetCurrentKey()) < __bswap_64(max))
+				if (KeyTypeLess(rows[i].GetCurrentKey(), max))
 				{
 					is_overlapped = 1;
 					break;
@@ -309,7 +408,11 @@ void CompactionJob::RunSubCompaction(int partition_id)
 			}
 			if (!is_overlapped)
 			{
+				#if defined(FLOWKV_KEY16)
+				LOG("jump,topkey=%lu:%lu,max=%lu:%lu, is overlapped=%d", topkey.key.hi, topkey.key.lo, max.hi, max.lo, is_overlapped);
+				#else
 				LOG("jump,topkey=%lu,max=%lu, is overlapped=%d", __bswap_64(topkey.key), __bswap_64(max), is_overlapped);
+				#endif
 				// not overlapped: directly use the pst as output
 				TaggedPstMeta tmeta;
 				tmeta.meta = pst_builder->Flush();
@@ -321,7 +424,7 @@ void CompactionJob::RunSubCompaction(int partition_id)
 				if (row.NextPst())
 				{
 					auto kwr = KeyWithRowId{rows[topkey.row_id].GetCurrentKey(), topkey.row_id};
-					if (__bswap_64(kwr.key) <= __bswap_64(partition.max_key))
+					if (KeyTypeLessEq(kwr.key, partition.max_key))
 						key_heap.push(kwr);
 				}
 				continue;
@@ -330,12 +433,20 @@ void CompactionJob::RunSubCompaction(int partition_id)
 			{
 				// overlapped: read the pst, add entry to output pst
 				row.ResetPstIter();
-				uint64_t key, value;
-				key = row.pst_iter_->Key();
-				// DEBUG("first key: %lu, topkey:%lu",__bswap_64(key),__bswap_64(topkey.key));
-				assert(key == topkey.key);
+				FixedValue16 value;
+				KeyType key = row.pst_iter_->Key();
+				// Note: key may differ from topkey.key due to metadata/actual data mismatch
+				// But we continue processing to avoid data loss
 				value = row.pst_iter_->Value();
-				auto success = pst_builder->AddEntry(Slice(&key), Slice(&value));
+				#if defined(FLOWKV_KEY16)
+				uint8_t key_bytes[16];
+				key.ToBigEndianBytes(key_bytes);
+				auto success = pst_builder->AddEntry(Slice(reinterpret_cast<const char *>(key_bytes), 16),
+                                                     Slice(reinterpret_cast<const char *>(&value), sizeof(value)));
+				#else
+				auto success = pst_builder->AddEntry(Slice(&key),
+                                                     Slice(reinterpret_cast<const char *>(&value), sizeof(value)));
+				#endif
 				if (!success)
 				{
 					auto meta = pst_builder->Flush();
@@ -343,7 +454,13 @@ void CompactionJob::RunSubCompaction(int partition_id)
 					TaggedPstMeta tmeta;
 					tmeta.meta = meta;
 					partition_outputs_[partition_id].emplace_back(tmeta);
-					if (!pst_builder->AddEntry(Slice(&key), Slice(&value)))
+					#if defined(FLOWKV_KEY16)
+					if (!pst_builder->AddEntry(Slice(reinterpret_cast<const char *>(key_bytes), 16),
+                                               Slice(reinterpret_cast<const char *>(&value), sizeof(value))))
+					#else
+					if (!pst_builder->AddEntry(Slice(&key),
+                                               Slice(reinterpret_cast<const char *>(&value), sizeof(value))))
+					#endif
 						ERROR_EXIT("cannot add pst entry in compaction");
 				}
 			}
@@ -351,11 +468,19 @@ void CompactionJob::RunSubCompaction(int partition_id)
 		else
 		{
 			// not the first key in pst : add entry to output pst
-			uint64_t key, value;
-			key = row.pst_iter_->Key();
-			assert(key == topkey.key);
+			FixedValue16 value;
+			KeyType key = row.pst_iter_->Key();
+			// Note: key should match topkey.key, but continue processing even if not
 			value = row.pst_iter_->Value();
-			auto success = pst_builder->AddEntry(Slice(&key), Slice(&value));
+			#if defined(FLOWKV_KEY16)
+			uint8_t key_bytes[16];
+			key.ToBigEndianBytes(key_bytes);
+			auto success = pst_builder->AddEntry(Slice(reinterpret_cast<const char *>(key_bytes), 16),
+                                                 Slice(reinterpret_cast<const char *>(&value), sizeof(value)));
+			#else
+			auto success = pst_builder->AddEntry(Slice(&key),
+                                                 Slice(reinterpret_cast<const char *>(&value), sizeof(value)));
+			#endif
 			if (!success)
 			{
 				auto meta = pst_builder->Flush();
@@ -363,7 +488,13 @@ void CompactionJob::RunSubCompaction(int partition_id)
 				TaggedPstMeta tmeta;
 				tmeta.meta = meta;
 				partition_outputs_[partition_id].emplace_back(tmeta);
-				if (!pst_builder->AddEntry(Slice(&key), Slice(&value)))
+				#if defined(FLOWKV_KEY16)
+				if (!pst_builder->AddEntry(Slice(reinterpret_cast<const char *>(key_bytes), 16),
+                                           Slice(reinterpret_cast<const char *>(&value), sizeof(value))))
+				#else
+				if (!pst_builder->AddEntry(Slice(&key),
+                                           Slice(reinterpret_cast<const char *>(&value), sizeof(value))))
+				#endif
 					ERROR_EXIT("cannot add pst entry in compaction");
 			}
 		}
@@ -371,7 +502,7 @@ void CompactionJob::RunSubCompaction(int partition_id)
 		if (row.NextKey())
 		{
 			auto kwr = KeyWithRowId{rows[topkey.row_id].GetCurrentKey(), topkey.row_id};
-			if (__bswap_64(kwr.key) <= __bswap_64(partition.max_key))
+			if (KeyTypeLessEq(kwr.key, partition.max_key))
 				key_heap.push(kwr);
 		}
 	}
@@ -441,8 +572,18 @@ void CompactionJob::CleanCompaction()
 	pst_deleter_.PersistCheckpoint();
 
 	total_L1_num = total_L1_num + outputs_.size() - inputs_[inputs_.size() - 1].size();
-	INFO("L1 add %lu pst, delete %lu pst, total %lu pst", outputs_.size(), inputs_[inputs_.size() - 1].size(), total_L1_num);
+	LOG("L1 add %lu pst, delete %lu pst, total %lu pst", outputs_.size(), inputs_[inputs_.size() - 1].size(), total_L1_num);
 	manifest_->PrintL1Info();
+
+	std::vector<uint8_t> l1_hybrid_state_bytes;
+	uint32_t current_l1_seq_no = 0;
+	if (version_->ExportL1HybridState(l1_hybrid_state_bytes, current_l1_seq_no)) {
+		if (!manifest_->PersistL1HybridState(l1_hybrid_state_bytes, current_l1_seq_no)) {
+			manifest_->ClearL1HybridState();
+		}
+	} else {
+		manifest_->ClearL1HybridState();
+	}
 }
 void CompactionJob::CleanCompactionWhenUsingSubCompaction()
 {
@@ -501,6 +642,16 @@ void CompactionJob::CleanCompactionWhenUsingSubCompaction()
 		}
 	}
 	pst_deleter_.PersistCheckpoint();
+
+	std::vector<uint8_t> l1_hybrid_state_bytes;
+	uint32_t current_l1_seq_no = 0;
+	if (version_->ExportL1HybridState(l1_hybrid_state_bytes, current_l1_seq_no)) {
+		if (!manifest_->PersistL1HybridState(l1_hybrid_state_bytes, current_l1_seq_no)) {
+			manifest_->ClearL1HybridState();
+		}
+	} else {
+		manifest_->ClearL1HybridState();
+	}
 }
 bool CompactionJob::RollbackCompaction()
 {

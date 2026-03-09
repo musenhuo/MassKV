@@ -1,6 +1,5 @@
 #include "util/util.h"
 #include "db_common.h"
-#include <libpmem.h>
 #include <sys/param.h>
 #include <cstring>
 #include <mutex>
@@ -12,9 +11,10 @@ class BitMap
 public:
     size_t total_bit_num_;
     std::atomic_uint64_t tail_bit_;
-    char *bitmap_;
-    char *history_bitmap_;
-    char *persist_addr_;
+    char *bitmap_=nullptr;
+    char *history_bitmap_=nullptr;
+    int fd;
+    off_t off;
     std::vector<size_t> freed_bits_;
     SpinLock lock_;
     bool use_free_list_ = false;
@@ -24,28 +24,29 @@ public:
     BitMap(size_t total_bits, bool debug = false) : debug_(debug)
     {
         total_bit_num_ = total_bits;
-
-        bitmap_ = new char[roundup(total_bit_num_, 8) / 8];
-        memset(bitmap_, 0, roundup(total_bit_num_, 8) / 8);
-        history_bitmap_ = new char[roundup(total_bit_num_, 8) / 8];
-        memset(history_bitmap_, 0, roundup(total_bit_num_, 8) / 8);
+        bitmap_ = static_cast<char*>(aligned_alloc(4096, SizeInByte()));
+        memset(bitmap_, 0, SizeInByte());
+        history_bitmap_ = static_cast<char*>(aligned_alloc(4096, SizeInByte()));
+        memset(history_bitmap_, 0, SizeInByte());
         tail_bit_ = 0;
         freed_bits_.reserve(total_bits);
     }
     ~BitMap()
     {
-        std::vector<uint64_t>().swap(freed_bits_);
-        delete[] bitmap_;
-        delete[] history_bitmap_;
+        // std::vector<uint64_t>().swap(freed_bits_);
+        // free(bitmap_);
+        // free(history_bitmap_);
     }
-    void SetPersistAddr(char *persist_addr) { 
-        persist_addr_ = persist_addr; 
+    void Setoff(off_t off_) { 
+        off = off_; 
     }
     void Recover()
     {
         freed_bits_.clear();
-        memcpy(bitmap_, persist_addr_, roundup(total_bit_num_, 8) / 8);
-        memcpy(history_bitmap_, bitmap_, roundup(total_bit_num_, 8) / 8);
+        ssize_t bytes_read = pread(fd, bitmap_, SizeInByte(), off);
+        if(bytes_read!=SizeInByte())
+            std::cout<<"recover wrong"<<std::endl; 
+        memcpy(history_bitmap_, bitmap_, SizeInByte());
         size_t tail = MAX_UINT64;
         bool tail_flag = true;
         for (int i = roundup(total_bit_num_, 8) / 8 - 1; i >= 0; i--)
@@ -77,47 +78,54 @@ public:
         }
         tail_bit_ = tail * 8;
     }
-    void RecoverFrom(char *src)
+    void RecoverFrom(off_t off_)
     {
-        char *temp = persist_addr_;
-        persist_addr_ = src;
+        off_t temp = off;
+        off = off_;
         Recover();
-        persist_addr_ = temp;
+        off = temp;
     }
     inline size_t SizeInByte()
     {
-        return roundup(total_bit_num_, 8) / 8;
+        return roundup(total_bit_num_, 4 * 1024 * 8) / 8;
     }
-    void PersistToPM()
+    void PersistToSSD()
     {
-        pmem_memcpy_persist(persist_addr_, bitmap_, SizeInByte());
+        ssize_t bytes_write = pwrite(fd, bitmap_, SizeInByte(), off);
+        if(bytes_write!=SizeInByte())
+            std::cout<<"PersistToSSD wrong"<<std::endl; 
+
     }
-    void PersistToPMOnlyAlloc()
+    void PersistToSSDOnlyAlloc()
     {
-        char *temp_arr = new char[SizeInByte()];
-        memcpy(temp_arr, persist_addr_, SizeInByte());
+        char *temp_arr = static_cast<char*>(aligned_alloc(4096, SizeInByte()));
+        ssize_t bytes_read = pread(fd, temp_arr, SizeInByte(), off);
+        if(bytes_read!=SizeInByte())
+            std::cout<<"PersistToSSDOnlyAlloc wrong"<<std::endl; 
         for (size_t i = 0; i < SizeInByte(); i++)
         {
-            // XOR(history,bitmap)=mask
-            // OR(mask,pmem)=new_pmem
             temp_arr[i] = (bitmap_[i] ^ history_bitmap_[i]) | temp_arr[i];
         }
         memcpy(bitmap_, temp_arr, SizeInByte());
-        pmem_memcpy_persist(persist_addr_, temp_arr, SizeInByte());
-        delete[] temp_arr;
+        ssize_t bytes_write = pwrite(fd, temp_arr, SizeInByte(), off);
+        if(bytes_write!=SizeInByte())
+            std::cout<<"PersistToSSDOnlyAlloc wrong"<<std::endl; 
+        free(temp_arr);
     }
-    void PersistToPMOnlyFree()
+    void PersistToSSDOnlyFree()
     {
-        char *temp_arr = new char[SizeInByte()];
-        memcpy(temp_arr, persist_addr_, SizeInByte());
+        char *temp_arr = static_cast<char*>(aligned_alloc(4096, SizeInByte()));
+        ssize_t bytes_read = pread(fd, temp_arr, SizeInByte(), off);
+        if(bytes_read!=SizeInByte())
+            std::cout<<"PersistToSSDOnlyFree wrong"<<std::endl; 
         for (size_t i = 0; i < SizeInByte(); i++)
         {
-            // XOR(history,bitmap)=mask
-            // AND(~mask,pmem)=new_pmem
             temp_arr[i] = ~(bitmap_[i] ^ history_bitmap_[i]) & temp_arr[i];
         }
-        pmem_memcpy_persist(persist_addr_, temp_arr, SizeInByte());
-        delete[] temp_arr;
+        ssize_t bytes_write = pwrite(fd, temp_arr, SizeInByte(), off);
+        if(bytes_write!=SizeInByte())
+            std::cout<<"PersistToSSDOnlyFree wrong"<<std::endl; 
+        free(temp_arr);
     }
     void CopyTo(char *dst)
     {

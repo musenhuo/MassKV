@@ -1,8 +1,20 @@
 .vscode
 build/
+build*/
 test/
 *.d
 *.out
 out.*
 perf.*
 a.cpp
+.pool/
+benchmark_pools/*.log
+experiments/performance_evaluation/**/results/
+hmasstree.tar.gz
+docs/FlowKV_ A Parallel and IO-Friendly Key-Value Store Exploiting High-Bandwidth Solid State Drives.pdf
+High efficent key-value  store.pptx
+High efficient key-value  store.docx
+lib/hmasstree/test_components
+lib/hmasstree/test_external_storage
+lib/hmasstree/test_l5_debug
+benchmark_pools/*.log

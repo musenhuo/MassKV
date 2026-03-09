@@ -13,6 +13,7 @@
 #include "db/pst_reader.h"
 #include "db/pst_builder.h"
 #include "db/pst_deleter.h"
+#include "lib/hybrid_l1/l1_hybrid_index.h"
 
 #include <algorithm>
 #include <queue>
@@ -22,8 +23,13 @@
 struct TreeMeta
 {
     bool valid = false;
-    uint64_t min_key = MAX_UINT64;
-    uint64_t max_key = 0;
+    #if defined(FLOWKV_KEY16)
+    KeyType min_key{MAX_UINT64, MAX_UINT64};
+    KeyType max_key{0, 0};
+    #else
+    KeyType min_key = MAX_UINT64;
+    KeyType max_key = 0;
+    #endif
     uint64_t size = 0;
 };
 
@@ -52,9 +58,13 @@ private:
 
     // level1
     std::vector<TaggedPstMeta> level1_tables_;
-    Index *level1_tree_;
+    flowkv::hybrid_l1::L1HybridIndex *level1_tree_;
     std::vector<size_t> level1_free_list_;
     PSTReader pst_reader_;
+
+    void RebuildLevel1Tree();
+    void RebuildLevel1Partitions(const std::vector<KeyType>& changed_route_keys);
+    std::vector<KeyType> CollectChangedRouteKeysForTable(const PSTMeta& table) const;
 
 public:
     Version(SegmentAllocator *seg_allocator);
@@ -62,6 +72,7 @@ public:
 
     int InsertTableToL0(TaggedPstMeta table, int tree_idx);
     int InsertTableToL1(TaggedPstMeta table);
+    void RecoverLevel1Tables(std::vector<TaggedPstMeta> tables, uint32_t next_l1_seq);
     bool DeleteTableInL1(PSTMeta table);
     // bool DeleteTable(int idx, int level_id);
 
@@ -91,6 +102,7 @@ public:
     int AddLevel0Tree();
     uint32_t GetCurrentL0TreeSeq();
     void SetCurrentL0TreeSeq(uint32_t seq);
+    void SetCurrentL1Seq(uint32_t seq);
     uint32_t GenerateL1Seq();
     bool FreeLevel0Tree();
     void UpdateLevel0ReadTail();
@@ -99,7 +111,28 @@ public:
         return (l0_read_tail_ + MAX_L0_TREE_NUM - l0_head_) % MAX_L0_TREE_NUM;
     };
     int PickLevel0Trees(std::vector<std::vector<TaggedPstMeta>> &outputs, std::vector<TreeMeta> &tree_metas, int max_size = MAX_L0_TREE_NUM);
-    bool PickOverlappedL1Tables(size_t min, size_t max, std::vector<TaggedPstMeta> &output);
+    bool PickOverlappedL1Tables(const KeyType &min, const KeyType &max, std::vector<TaggedPstMeta> &output);
 
     bool L1TreeConsistencyCheckAndFix(PSTDeleter* pst_deleter,Manifest* manifest);
+
+    bool DebugValidateLevel1Structure() const;
+    flowkv::hybrid_l1::L1HybridIndex::MemoryUsageStats DebugEstimateLevel1MemoryUsage() const;
+    void DebugExportLevel1Records(std::vector<flowkv::hybrid_l1::SubtreeRecord> &output) const;
+    void DebugExportLevel1LocalFragments(std::vector<flowkv::hybrid_l1::SubtreeRecord> &output) const;
+    bool DebugResolveLevel1Record(const flowkv::hybrid_l1::SubtreeRecord &record, TaggedPstMeta &output) const;
+    void DebugExportActiveLevel1Tables(std::vector<TaggedPstMeta> &output) const;
+    void DebugCollectLevel1Candidates(const KeyType &key, std::vector<TaggedPstMeta> &output) const;
+    void DebugCollectLevel1Overlaps(const KeyType &min, const KeyType &max, std::vector<TaggedPstMeta> &output) const;
+    bool ExportL1HybridState(std::vector<uint8_t>& bytes_out, uint32_t& current_l1_seq_no) const;
+    bool ImportL1HybridState(const std::vector<uint8_t>& bytes, uint32_t expected_l1_seq_no);
+    
+    // Cache statistics
+    uint64_t GetCacheHits() const { return pst_reader_.GetCacheHits(); }
+    uint64_t GetCacheMisses() const { return pst_reader_.GetCacheMisses(); }
+    
+    // L1 index statistics
+    void PrintL1IndexStats();
 };
+
+// Debug stats for L1 lookup
+void PrintL1DebugStats();

@@ -16,63 +16,27 @@
 
 class DataBlockWriter
 {
-public:
-    virtual bool AddEntry(Slice key, Slice value)=0;
-    virtual uint64_t GetCurrentMinKey()=0;
-    virtual uint64_t GetCurrentMaxKey()=0;
-    virtual uint64_t Flush()=0;
-    virtual int PersistCheckpoint()=0;
-	virtual int Empty(){return false;}
-
-private:
-    virtual void allocate_block()=0;
-	
-};
-
-
-class DataBlockWriterPm: public DataBlockWriter
-{
 private:
     SegmentAllocator *seg_allocator_;
     SortedSegment *current_segment_;
-    PDataBlockPmWrapper blocks_buf_;
+    PDataBlockWrapper blocks_buf_;
     std::vector<SortedSegment*> used_segments_;
 	int num = 0;
+    int fd;
 
 public:
-    DataBlockWriterPm(SegmentAllocator *allocator);
-    ~DataBlockWriterPm();
+    DataBlockWriter(SegmentAllocator *allocator);
+    ~DataBlockWriter();
 
-    virtual bool AddEntry(Slice key, Slice value) override;
-    virtual uint64_t GetCurrentMinKey() override;
-    virtual uint64_t GetCurrentMaxKey() override;
-    virtual uint64_t Flush() override;
-    virtual int PersistCheckpoint() override;
-	virtual int Empty() override;
-
-private:
-    virtual void allocate_block() override;
-};
-
-class DataBlockWriterSsd: public DataBlockWriter
-{
-private:
-    SegmentAllocator *seg_allocator_;
-    SortedSegmentOnSSD *current_segment_;
-    PDataBlockSsdWrapper blocks_buf_;
-    std::vector<SortedSegmentOnSSD*> used_segments_;
-
-public:
-    DataBlockWriterSsd(SegmentAllocator *allocator);
-    ~DataBlockWriterSsd();
-
-    virtual bool AddEntry(Slice key, Slice value) override;
-    virtual uint64_t GetCurrentMinKey() override;
-    virtual uint64_t GetCurrentMaxKey() override;
-    virtual uint64_t Flush() override;
-    virtual int PersistCheckpoint() override;
+    virtual bool AddEntry(Slice key, Slice value);
+    virtual KeyType GetCurrentMinKey();
+    virtual KeyType GetCurrentMaxKey();
+    virtual KeyType GetKey(size_t idx);
+    virtual uint64_t Flush();
+    virtual int PersistCheckpoint();
+	virtual int Empty();
 
 private:
-    virtual void allocate_block() override;
+    virtual void allocate_block();
 };
 

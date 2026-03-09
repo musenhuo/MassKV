@@ -1,0 +1,4 @@
+add_subdirectory(01_end_to_end_semantics)
+add_subdirectory(02_structure_consistency)
+add_subdirectory(03_long_running_cycles)
+add_subdirectory(04_differential_regression)

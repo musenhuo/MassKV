@@ -1,0 +1,2 @@
+add_subdirectory(correctness_regression)
+add_subdirectory(performance_evaluation)

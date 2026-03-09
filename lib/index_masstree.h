@@ -51,11 +51,11 @@ public:
     {
         mt_->scan(key, cnt, vec);
     }
-    virtual void Scan2(const KeyType key, int cnt, std::vector<uint64_t> &kvec, std::vector<ValueType> &vvec) override
+    virtual void Scan2(const KeyType key, int cnt, std::vector<KeyType> &kvec, std::vector<ValueType> &vvec) override
     {
         mt_->scan(key, cnt, kvec, vvec);
     }
-    virtual void ScanByRange(const KeyType start, const KeyType end, std::vector<uint64_t> &kvec, std::vector<ValueType> &vvec) override
+    virtual void ScanByRange(const KeyType start, const KeyType end, std::vector<KeyType> &kvec, std::vector<ValueType> &vvec) override
     {
         mt_->scan(start, end, kvec, vvec);
     }
