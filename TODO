@@ -1,5 +1,0 @@
-Bugs to fix:
-1. May cause errors in compaction when key=0.
-2. Manifest takes up an expectedly large PM space.
-Functionalities: 
-1. Variable length KV is currently not supported when key-value separation is not enabled.

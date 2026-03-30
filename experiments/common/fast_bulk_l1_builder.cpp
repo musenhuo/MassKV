@@ -67,8 +67,12 @@ size_t UsedCountForPrefix(const FastBulkL1BuildOptions& options, RoutePrefix pre
         return static_cast<size_t>(prefix) < rem ? base + 1 : base;
     }
 
-    const size_t hot_prefixes = std::max<size_t>(1, options.prefix_count / 5);
-    const size_t hot_keys = options.key_count * 80 / 100;
+    size_t hot_prefixes = std::max<size_t>(1, options.prefix_count / 5);
+    size_t hot_keys = options.key_count * 80 / 100;
+    if (options.distribution == PrefixDistribution::kPrefixSkewExtreme) {
+        hot_prefixes = std::max<size_t>(1, options.prefix_count / 100);
+        hot_keys = options.key_count * 99 / 100;
+    }
     const size_t cold_keys = options.key_count - hot_keys;
     if (static_cast<size_t>(prefix) < hot_prefixes) {
         const size_t base = hot_keys / hot_prefixes;
@@ -93,8 +97,12 @@ KeyType KeyForLogicalIndex(const FastBulkL1BuildOptions& options, size_t logical
         return ComposeKey(prefix, suffix);
     }
 
-    const size_t hot_prefixes = std::max<size_t>(1, options.prefix_count / 5);
-    const size_t hot_keys = options.key_count * 80 / 100;
+    size_t hot_prefixes = std::max<size_t>(1, options.prefix_count / 5);
+    size_t hot_keys = options.key_count * 80 / 100;
+    if (options.distribution == PrefixDistribution::kPrefixSkewExtreme) {
+        hot_prefixes = std::max<size_t>(1, options.prefix_count / 100);
+        hot_keys = options.key_count * 99 / 100;
+    }
     if (logical_idx < hot_keys) {
         const RoutePrefix prefix = static_cast<RoutePrefix>(logical_idx % hot_prefixes);
         const RouteSuffix suffix = static_cast<RouteSuffix>(logical_idx / hot_prefixes);

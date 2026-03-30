@@ -8,6 +8,7 @@
 #include <array>
 #include <cstdint>
 #include <cstring>
+#include <functional>
 #include <tuple>
 #include <vector>
 #include "config.h"
@@ -403,6 +404,29 @@ public:
     virtual void ScanByRange(const KeyType start, const KeyType end, std::vector<KeyType> &kvec, std::vector<ValueType> &vvec)
     {
         // 约定：ScanByRange(start, end, ...) 应返回所有满足 start <= entry_key <= end 的记录（按 key 升序）。
+        ERROR_EXIT("not supported in this class");
+    }
+
+    /**
+     * @brief 按序遍历所有 entry，对每条调用 callback。
+     * @param callback 回调函数，参数为 (key, encoded_value)，返回 false 终止遍历。
+     *
+     * 用于 flush 路径，避免将全部 entry 复制到临时 vector。
+     */
+    virtual void ForEachEntry(std::function<bool(KeyType, ValueType)> callback)
+    {
+        ERROR_EXIT("not supported in this class");
+    }
+
+    /**
+     * @brief 按 key 范围遍历 entry，对每条调用 callback。
+     * @param start 范围起始 key。
+     * @param end 范围结束 key。
+     * @param callback 回调函数，参数为 (key, encoded_value)，返回 false 终止遍历。
+     */
+    virtual void ForEachEntryInRange(const KeyType start, const KeyType end,
+                                     std::function<bool(KeyType, ValueType)> callback)
+    {
         ERROR_EXIT("not supported in this class");
     }
 };

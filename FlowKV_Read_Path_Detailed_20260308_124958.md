@@ -29,11 +29,10 @@
    - `prefix / route_key / generation / record_count`
    - `subtree_store`（磁盘句柄，含 `root_page_id/page_count/record_count`）
 5. `SubtreeRecord`：
-   - `table_idx`（指向 `level1_tables_`）
    - `leaf_value`（44/12/8：block ptr / offset / count）
 6. `TaggedPstMeta / PSTMeta`：
-   - `datablock_ptr_`（4KB KV block 物理地址）
-   - `entry_num_`（块内有效条目数）
+   - 仍存在于控制面与 compaction 逻辑中
+   - 不再参与 L1 点查主路径
 
 ---
 
@@ -72,31 +71,27 @@
 1. `Version::Get` 调 `FindTableBySubtreeIndex` -> `L1HybridIndex::LookupCandidate`。
 2. `FixedRouteLayout::FindPartitionByKey`：
    - 从 key 提取 prefix；
-   - 在 route Masstree 查 `prefix -> partition_idx`。
-3. 得到目标 `RoutePartition`。
+   - 在 route Masstree 查 `prefix -> root_page_ptr`。
+3. 得到目标 subtree 根页物理位置。
 
 ### Step 4: L1 子树页级检索（磁盘 B+Tree）
 
 1. `LookupCandidatesFromDisk(partition_idx, key, limit=1)`。
-2. 解析查询元数据：
-   - 若 `subtree_store.HasQueryMeta()`：直接拿 `root_page_id/page_count/record_count`；
-   - 否则（legacy 快照）回退读一次 subtree manifest 页。
-3. 从 `root_page_id` 开始逐层读取页面：
-   - 每层 `LoadPageById` 一次；
+2. 从 `root_page_ptr` 开始逐层读取页面：
+   - 每层按物理页地址读取一次；
    - internal 页：按 `child_high_keys` 选择下层 child；
    - leaf 页：`lower_bound` 后顺序检查 `SubtreeRecord`。
-4. 找到命中 `SubtreeRecord`（含 `table_idx`、`leaf_value`）后返回。
+3. 找到命中 `SubtreeRecord`（含 `leaf_value`）后返回。
 
 ### Step 5: 由 SubtreeRecord 落到 PST 数据块
 
-1. `table_idx -> level1_tables_[idx]` 取 `PSTMeta`。
-2. 先做 table 有效性与 key range 检查。
-3. 若 `leaf_value` 可用，尝试“窗口化读取”：
-   - 由 `kv_block_ptr/offset/count` 计算 hinted 位置；
-   - `pst_reader->PointQuery(hinted_off, ..., hinted_entries)`。
-4. 若窗口化 miss，则回退整块读：
-   - `pst_reader->PointQuery(datablock_ptr_, ..., entry_num_)`。
-5. 命中后若值为 tombstone -> 返回 not found；否则返回 found。
+1. 解码 `leaf_value`，得到：
+   - `kv_block_ptr`
+   - `offset`
+   - `count`
+2. 由 `kv_block_ptr` 直接还原目标 `4KB KV block` 物理地址。
+3. 在 `[offset, offset+count)` 窗口内对该 block 做二分查询。
+4. 命中后若值为 tombstone -> 返回 not found；否则返回 found。
 
 ---
 
@@ -130,33 +125,22 @@
    - `R_l1_idx ≈ 2`
    - `R_l1_pst ≈ 1`
    - 总计约 `3` 次读 I/O。
-3. legacy 快照（无 root 元数据）：
-   - 额外 `+1` 次 manifest 页读取。
-
 ---
 
-## 5. “root 直达”改造后相对旧路径的变化
+## 5. 当前收敛后的关键变化
 
-旧路径（每次固定）：
-
-1. 读 subtree manifest 页；
-2. 再 root->leaf。
-
-新路径（当前）：
-
-1. 直接用 `subtree_store` 内 root 元数据；
-2. 直接 root->leaf；
-3. 仅 legacy 快照回退读 manifest。
-
-效果：点查路径中 L1 索引页 I/O 理论减少 `1` 次（新快照数据）。
+1. route 侧已收敛为 `prefix -> root_page_ptr`。
+2. subtree 侧已收敛为 `suffix` 下钻。
+3. leaf payload 已收敛为“直接物理块引用”，不再经过 `table_idx -> PSTMeta`。
+4. 点查主路径不再读取 subtree manifest，不再回查 `level1_tables_`。
 
 ---
 
 ## 6. 当前实现中的关键边界情况
 
-1. `leaf_value` 窗口提示路径在 `use_direct_io=1` 下，如果 `hinted_off` 不是 4KB 对齐，`pread(O_DIRECT)` 可能失败，随后会走整块回退读取。
-2. 因此在某些 workload 下，`R_l1_pst` 可能出现“先失败一次再成功一次”的额外成本。
-3. 查询正确性仍依赖回退路径保障（窗口化 miss/失败不影响最终正确性）。
+1. `kv_block_ptr` 还原后的目标地址必须是 KV block 对齐地址。
+2. `offset + count` 必须落在 `PDataBlock::MAX_ENTRIES` 上界内。
+3. 当前正确性依赖 leaf record 中窗口描述与真实块内 prefix 分布一致。
 
 ---
 
@@ -168,7 +152,7 @@
 4. L1 路由层（内存）：`FixedRouteLayout.route_index_`（Masstree）
 5. L1 子树层（磁盘页）：`SubtreePageStore + SubtreePageCodec`
 6. KV 块读取：`PSTReader + DataBlockReader`
-7. 元数据映射：`SubtreeRecord -> table_idx -> level1_tables_[idx] -> PSTMeta`
+7. 直接块路由：`SubtreeRecord.leaf_value -> kv_block_ptr/offset/count`
 
 ---
 
@@ -176,4 +160,4 @@
 
 当前一次 `Get` 的主路径是：
 
-`MemTable(内存) -> L0(内存索引 + 4KB块读) -> L1 Route(Masstree内存) -> L1 Subtree(root直达页读) -> PST 4KB块读 -> 块内二分返回值`。
+`MemTable(内存) -> L0(内存索引 + 4KB块读) -> L1 Route(Masstree内存) -> L1 Subtree(root直达页读, suffix下钻) -> PST 4KB块窗口二分 -> 返回值`。

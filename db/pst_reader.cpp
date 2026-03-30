@@ -51,7 +51,6 @@ bool PSTReader::PointQueryWindow(uint64_t block_addr,
                                  Slice key,
                                  const char *value_out,
                                  int *value_size,
-                                 uint16_t entry_num,
                                  uint16_t start_entry,
                                  uint16_t entry_count)
 {
@@ -59,7 +58,6 @@ bool PSTReader::PointQueryWindow(uint64_t block_addr,
         block_addr,
         key,
         value_out,
-        static_cast<int>(entry_num),
         start_entry,
         entry_count);
     *value_size = static_cast<int>(sizeof(FixedValue16));

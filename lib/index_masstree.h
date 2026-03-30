@@ -60,6 +60,21 @@ public:
         mt_->scan(start, end, kvec, vvec);
     }
 
+    virtual void ForEachEntry(std::function<bool(KeyType, ValueType)> callback) override
+    {
+#if defined(FLOWKV_KEY16)
+        mt_->for_each(KeyType{0, 0}, std::move(callback));
+#else
+        mt_->for_each(0, std::move(callback));
+#endif
+    }
+
+    virtual void ForEachEntryInRange(const KeyType start, const KeyType end,
+                                     std::function<bool(KeyType, ValueType)> callback) override
+    {
+        mt_->for_each_range(start, end, std::move(callback));
+    }
+
 private:
     MasstreeWrapper *mt_;
 

@@ -1,9 +1,9 @@
-# L1 Hybrid B+Tree 设计方案 V4（磁盘驻留查询）
+# L1 Hybrid B+Tree 设计方案 V4（SSD 驻留主路径）
 
 ## 1. 文档定位
 
 V4 是在 V3 基础上的方向切换版本：  
-系统目标从“内存驻留 subtree 查询”切换为“磁盘驻留 subtree 查询”。
+系统目标从“内存驻留 subtree 查询”切换为“SSD 驻留 subtree 查询”。
 
 从本版开始，后续开发与实验基线只看：
 
@@ -13,7 +13,8 @@ V4 是在 V3 基础上的方向切换版本：
 ## 2. V4 核心目标
 
 - `RouteLayer` 继续内存驻留（prefix -> partition），保持小体量路由。
-- `SubtreeLayer` 改成磁盘驻留，查询时按需加载 page set。
+  - 实现约束：路由索引必须保持 `Masstree` 结构，不切换为纯数组二分替代。
+- `SubtreeLayer` 为 SSD 驻留，查询时按页读取。
 - 去掉 `RoutePartition` 对常驻 `L1SubtreeBPTree` 的强依赖。
 - 保留 `B2` 的 prefix-local fragment 语义。
 
@@ -21,19 +22,9 @@ V4 是在 V3 基础上的方向切换版本：
 
 ### 3.1 RoutePartition
 
-`RoutePartition` 从：
+`RoutePartition` 已收敛为：
 
-- `std::shared_ptr<const L1SubtreeBPTree> subtree`
-
-切换为：
-
-- `SubtreePageStoreHandle subtree_store`（磁盘句柄）
-- `std::shared_ptr<const SubtreePageSet> subtree_pages_cache`（仅回退路径）
-
-其中：
-
-- `subtree_store` 是 V4 的正式路径
-- `subtree_pages_cache` 仅用于 allocator 未接入时的 debug/unit-test 路径
+- `SubtreePageStoreHandle subtree_store`（SSD 页句柄）
 
 ### 3.2 查询路径
 
@@ -44,7 +35,7 @@ V4 是在 V3 基础上的方向切换版本：
 3. cache miss 时根据 `subtree_store` 从 `SubtreePageStore` 加载并 `ImportPageSet`
 4. 在还原树上执行点查/范围查，并按容量/字节上限回收 cache
 
-当前收紧（2026-03-06 更新）：
+当前收紧（2026-03-10 更新）：
 
 - 点查主路径已改为页级读取：
   - 优先使用 `subtree_store` 句柄内的 root 元数据直达根页
@@ -56,7 +47,7 @@ V4 是在 V3 基础上的方向切换版本：
   - 再定位首个覆盖 `start` 的 leaf
   - 再沿 leaf 链逐页扫描到 `end`
   - legacy 快照（无 root 元数据）回退一次 manifest 读取
-- 仅在页级解码失败时才回退到整树加载路径（容错回退）。
+- 页级解码失败按错误返回，不再回退到整树加载路径。
 
 ## 4. 构建与更新路径
 
@@ -69,8 +60,7 @@ V4 是在 V3 基础上的方向切换版本：
 
 当前策略：
 
-- allocator 已接入时采用严格磁盘驻留：`Persist` 失败直接抛错，不再静默回退
-- allocator 未接入时允许 `subtree_pages_cache`（debug/unit-test）
+- 采用严格 SSD 驻留：`Persist` 失败直接抛错，不允许内存回退。
 
 ## 5. CoW 与更新策略（V4 当前口径）
 
@@ -105,6 +95,8 @@ V4 当前已经落地：
 - manifest 快照 envelope 校验协议（`magic/version/full-seq/checksum`）
 - manifest root 原子提交协议（双槽切换，inactive slot 写入后再切 active slot）
 - `RangeScan` 页级化（`root -> leaf` 路径 + leaf 链扫描）
+- `L1HybridIndex` 构造强制要求 `segment_allocator != nullptr`
+- 点查/范围查仅走页级路径，不再整树回退
 
 V4 当前仍未完成：
 
@@ -155,9 +147,7 @@ V4 当前仍未完成：
 - 已接入 CoW 复用统计：
   - 在 `EstimateMemoryUsage` 导出 `cow_persist_calls/reused/written`。
   - 已打通到 `point_lookup_benchmark` 输出。
-- `subtree_pages_cache` 已收紧为 debug-only：
-  - 仅 `segment_allocator == nullptr` 时允许走该路径。
-  - allocator 已接入时若 `Persist` 失败会直接报错。
+- `RoutePartition` 已移除 `subtree_pages_cache` 回退字段。
 - 页级 CoW 与回收已落地：
   - `PersistCow` 复用未变化页，写入变化页。
   - `DestroyUnshared` 只回收旧版本独占页。
@@ -226,3 +216,55 @@ V4 当前仍未完成：
   - `sizeof(SubtreeStoredPageRef): 16 -> 8`
 - 快速 sanity（`1M keys / 100k prefixes`）：
   - `l1_index_bytes_estimated=15,552,480`（此前同量级约 `26,726,656`）
+
+## 13. 最新收敛（2026-03-09，路由层回归 Masstree）
+
+- `FixedRouteLayout` 已恢复 `Masstree` 路由索引（`prefix -> partition_idx`）：
+  - `RefreshPartitions` 会在排序后重建 route masstree。
+  - `FindPartitionByKey` 优先走 masstree 点查，不再走纯 `lower_bound` 主路径。
+  - `CollectPartitionsForRange` 走 masstree 范围扫描，再映射到 partition 下标。
+- 设计约束重申：
+  - 双层结构核心不变：`layer0(route)` 必须为 masstree，`layer1(subtree)` 为 B+tree。
+
+## 14. 最新收敛（2026-03-09，内存压缩 V1 验证）
+
+- 已落地 V1 压缩：
+  - `SubtreePageStoreHandle` 收紧到 `32B`（去除常驻 `page_count/record_count`，`page_size` 收紧为 `uint16`）。
+  - `RoutePartition` 收紧到 `72B`（`generation` 收紧为 `uint32`）。
+- 10M 点查验证（`prefix=1,000,000`）：
+  - `l1_index_bytes_estimated=187,052,480`
+  - `route_partition=72,000,000`
+  - `route_masstree_est=64,000,000`
+  - `subtree=48,000,000`
+- 结论：
+  - V1 下降有效，但离 `<50MB` 仍远。
+  - 下一阶段必须进入“紧凑描述符 + 共享页引用池 + 只读连续布局”。
+
+## 15. 最新收敛（2026-03-09，连续数组 + 32B 对齐 + 只读快照）
+
+- 已落地只读发布快照结构：
+  - 新增 `PublishedSnapshot`：
+    - `routes`：连续数组（`PublishedRoutePartition`）
+    - `page_refs`：全局共享连续页引用池（`SubtreeStoredPageRef`）
+- `PublishedRoutePartition` 采用 `alignas(32)`（紧凑 32B 描述符）。
+
+## 16. 最新收敛（2026-03-10，SSD-only 约束落地）
+
+- 口径统一：L1 索引为 SSD 驻留主路径，不再维护“内存模式/磁盘模式”双口径。
+- `RoutePartition` 删除 `subtree_pages_cache`，仅保留 `subtree_store` 页句柄。
+- `L1HybridIndex` 构造阶段强制 `segment_allocator` 非空。
+- `LookupCandidate/LookupCandidates/RangeScan` 仅使用页级查询路径：
+  - 点查：`root -> internal -> leaf`
+  - 范围查：定位首 leaf 后沿 leaf 链扫描
+  - 失败直接返回错误，不回退整树导入。
+- `MemoryUsageStats` 去除治理字段重复计费：
+  - `governance_bytes` 不再额外叠加（已包含在 `RoutePartition`）。
+- 查询热路径已切换到只读快照：
+  - 点查/范围查的磁盘页读取不再依赖每个 `RoutePartition` 自带的 `pages vector`。
+  - 读取通过 `SubtreePageStoreView`（非 owning 视图）直接访问快照切片。
+- 内存治理策略：
+  - publish 后释放每个 partition 自带的 `pages vector`（仅保留只读快照中的连续池）。
+  - 在 `Clear/BulkLoad/Rebuild` 前按需回填（materialize）为 owning vector，保证 CoW/回收逻辑不变。
+- 本次落地意义：
+  - 读路径达成“连续数组 + 对齐描述符 + 只读结构”。
+  - 写路径保持兼容，未破坏现有 CoW 与 snapshot 协议。

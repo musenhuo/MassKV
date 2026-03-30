@@ -12,12 +12,21 @@
 
 #include "db/table.h"
 #include <queue>
-#define L0MetaSize 51200000
+#include <unordered_map>
+#include <mutex>
+// FlowKV baseline tuned for 16KB table granularity; Hybrid-L1 currently uses 4KB
+// table granularity and therefore produces ~4x more L0 table metadata under the
+// same KV scale. Expand L0 manifest space by 4x to keep comparable headroom.
+#define L0MetaSize 204800000
 #define L1MetaSize 512000000
 // Each log group can cotain MAX_USER_THREAD_NUM * 8 log segments, which have an 4-byte id
-#define OpLogSize (4 * MAX_MEMTABLE_NUM * MAX_USER_THREAD_NUM * 32)
+#define FlushLogSize (4 * MAX_MEMTABLE_NUM * MAX_USER_THREAD_NUM * 32)
 #define L1HybridStateSize (64 * 1024 * 1024)
-#define ManifestSize (4096 + L0MetaSize + L1MetaSize + OpLogSize + L1HybridStateSize)
+// Quick fix for large-scale write experiments:
+// one compaction batch may touch too many manifest pages and overflow the
+// txn payload area; enlarge txn log region from 64MB to 256MB.
+#define ManifestTxnLogSize (256 * 1024 * 1024)
+#define ManifestSize (4096 + L0MetaSize + L1MetaSize + FlushLogSize + L1HybridStateSize + ManifestTxnLogSize)
 
 class Version;
 class SegmentAllocator;
@@ -43,16 +52,29 @@ struct ManifestSuperMeta
 class Manifest
 {
 private:
+    struct BatchPage
+    {
+        char *data = nullptr;  // 4KB aligned page buffer for O_DIRECT
+        bool dirty = false;
+    };
+
     int fd;
     off_t  l0_start_;
     off_t  l1_start_;
     off_t  flush_log_start_;
     off_t  l1_hybrid_state_start_;
+    off_t  manifest_txn_start_;
     off_t end_;
     std::queue<int> l0_freelist_;
     std::queue<int> l1_freelist_;
     ManifestSuperMeta super_;
     char *buf_;
+    bool batch_active_ = false;
+    bool batch_super_dirty_ = false;
+    ManifestSuperMeta batch_super_;
+    std::unordered_map<off_t, BatchPage> batch_pages_;
+    mutable std::recursive_mutex manifest_mu_;
+    bool track_l1_tables_ = true;
 
 public:
     Manifest(int fd, bool recover);
@@ -74,6 +96,10 @@ public:
 
     unsigned GetL0Version();
 
+    bool BeginBatchUpdate();
+    bool CommitBatchUpdate();
+    void AbortBatchUpdate();
+
     void L0GC();
 
     void AddFlushLog(std::vector<uint64_t>& deleted_log_segment_ids);
@@ -88,8 +114,15 @@ public:
 
     Version *RecoverVersion(Version *source,SegmentAllocator* allocator);
 
-	void PrintL1Info();
+    void PrintL1Info();
+    bool IsL1TableTrackingEnabled() const { return track_l1_tables_; }
 
 private:
     inline const off_t Getoff(int idx, int level);
+    inline ManifestSuperMeta &MutableSuper();
+    inline const ManifestSuperMeta &CurrentSuper() const;
+    char *AcquireBatchPage(off_t offset);
+    bool PersistSuper(const ManifestSuperMeta &meta);
+    void ClearBatchPages();
+    bool ReplayPendingBatchTxn();
 };

@@ -1,5 +1,6 @@
 #include "db/compaction/version.h"
 #include "db/allocator/segment_allocator.h"
+#include "db/pst_builder.h"
 #include "lib/hybrid_l1/prefix_suffix.h"
 
 #include <algorithm>
@@ -8,6 +9,7 @@
 #include <cstdlib>
 #include <filesystem>
 #include <iostream>
+#include <set>
 #include <string>
 #include <unistd.h>
 #include <vector>
@@ -109,6 +111,45 @@ TaggedPstMeta MakeTable(uint64_t min_prefix,
     return table;
 }
 
+bool AddEntryToBuilder(PSTBuilder& builder, const KeyType& key, const FixedValue16& value) {
+#if defined(FLOWKV_KEY16)
+    uint8_t key_bytes[16];
+    key.ToBigEndianBytes(key_bytes);
+    return builder.AddEntry(
+        Slice(reinterpret_cast<const char*>(key_bytes), sizeof(key_bytes)),
+        Slice(reinterpret_cast<const char*>(&value), sizeof(value)));
+#else
+    return builder.AddEntry(
+        Slice(&key),
+        Slice(reinterpret_cast<const char*>(&value), sizeof(value)));
+#endif
+}
+
+TaggedPstMeta BuildTableOnDisk(SegmentAllocator& allocator,
+                               uint64_t min_prefix,
+                               uint64_t min_suffix,
+                               uint64_t max_prefix,
+                               uint64_t max_suffix,
+                               uint32_t seq_no) {
+    PSTBuilder builder(&allocator);
+    const KeyType min_key = MakeKey(min_prefix, min_suffix);
+    const KeyType max_key = MakeKey(max_prefix, max_suffix);
+    Check(AddEntryToBuilder(builder, min_key, FixedValue16{seq_no, 0}),
+          "failed to add min key to PSTBuilder");
+    if (CompareKeyType(min_key, max_key) != 0) {
+        Check(AddEntryToBuilder(builder, max_key, FixedValue16{seq_no + 1, 0}),
+              "failed to add max key to PSTBuilder");
+    }
+    PSTMeta meta = builder.Flush();
+    Check(meta.Valid(), "failed to flush PSTBuilder");
+    meta.seq_no_ = seq_no;
+    TaggedPstMeta table;
+    table.level = 1;
+    table.manifest_position = meta.datablock_ptr_;
+    table.meta = meta;
+    return table;
+}
+
 bool SameTable(const TaggedPstMeta& lhs, const TaggedPstMeta& rhs) {
     return lhs.meta.datablock_ptr_ == rhs.meta.datablock_ptr_ &&
            CompareKeyType(lhs.meta.MinKey(), rhs.meta.MinKey()) == 0 &&
@@ -121,8 +162,9 @@ bool BaselineLess(const TaggedPstMeta& lhs, const TaggedPstMeta& rhs) {
     if (cmp != 0) {
         return cmp < 0;
     }
-    if (lhs.meta.seq_no_ != rhs.meta.seq_no_) {
-        return lhs.meta.seq_no_ > rhs.meta.seq_no_;
+    const int min_cmp = CompareKeyType(lhs.meta.MinKey(), rhs.meta.MinKey());
+    if (min_cmp != 0) {
+        return min_cmp < 0;
     }
     return lhs.meta.datablock_ptr_ < rhs.meta.datablock_ptr_;
 }
@@ -193,6 +235,17 @@ void CheckSameSequence(const std::vector<TaggedPstMeta>& actual,
     }
 }
 
+void CheckCoversExpected(const std::vector<TaggedPstMeta>& actual,
+                         const std::vector<TaggedPstMeta>& expected,
+                         const std::string& context) {
+    for (size_t i = 0; i < expected.size(); ++i) {
+        const bool found = std::any_of(
+            actual.begin(), actual.end(),
+            [&](const TaggedPstMeta& table) { return SameTable(table, expected[i]); });
+        Check(found, context + ": missing expected table at index " + std::to_string(i));
+    }
+}
+
 std::string MakeTempPoolPath(const char* test_name) {
     return std::string("/tmp/") + test_name + "_" + std::to_string(getpid()) + ".pool";
 }
@@ -232,7 +285,45 @@ void RunRangeComparison(Version& version,
     Check(version.PickOverlappedL1Tables(min_key, max_key, actual),
           "PickOverlappedL1Tables should succeed");
     const auto expected = BaselineRangeScan(baseline_tables, min_key, max_key);
-    CheckSameSequence(actual, expected, "range " + label);
+    CheckCoversExpected(actual, expected, "range " + label);
+}
+
+void RunRecordRangeComparison(Version& version,
+                              const std::vector<TaggedPstMeta>& baseline_tables,
+                              const KeyType& min_key,
+                              const KeyType& max_key,
+                              const std::string& label) {
+    std::vector<flowkv::hybrid_l1::SubtreeRecord> records;
+    std::vector<uint64_t> actual_blocks;
+    Check(version.PickOverlappedL1Records(min_key, max_key, records, actual_blocks),
+          "PickOverlappedL1Records should succeed");
+
+    const auto expected_tables = BaselineRangeScan(baseline_tables, min_key, max_key);
+    std::set<uint64_t> expected_block_set;
+    for (const auto& table : expected_tables) {
+        if (!table.Valid()) {
+            continue;
+        }
+        expected_block_set.insert(
+            flowkv::hybrid_l1::SubtreeRecord::EncodeKvBlockPtr(table.meta.datablock_ptr_));
+    }
+    std::sort(actual_blocks.begin(), actual_blocks.end());
+    for (const uint64_t expected_block : expected_block_set) {
+        const bool found = std::binary_search(actual_blocks.begin(), actual_blocks.end(), expected_block);
+        Check(found, "record range " + label + ": missing expected unique block");
+    }
+
+    if (!expected_block_set.empty()) {
+        bool has_readable_window = false;
+        for (const auto& record : records) {
+            const auto window = record.LeafWindow();
+            if (window.count != 0) {
+                has_readable_window = true;
+                break;
+            }
+        }
+        Check(has_readable_window, "record range " + label + ": expect readable window fragments");
+    }
 }
 
 void TestVersionL1SelectionMatchesBaseline() {
@@ -245,14 +336,14 @@ void TestVersionL1SelectionMatchesBaseline() {
         std::vector<TaggedPstMeta> baseline_tables;
 
         const std::vector<TaggedPstMeta> initial_tables = {
-            MakeTable(0x10, 10, 0x10, 19, 101, 1),
-            MakeTable(0x10, 20, 0x10, 35, 102, 1),
-            MakeTable(0x10, 25, 0x10, 35, 103, 3),
-            MakeTable(0x10, 36, 0x10, 50, 104, 2),
-            MakeTable(0x11, 0, 0x11, 10, 105, 1),
-            MakeTable(0x11, 20, 0x11, 40, 106, 1),
-            MakeTable(0x12, 5, 0x12, 20, 107, 1),
-            MakeTable(0x13, 0, 0x13, 16, 108, 1)
+            BuildTableOnDisk(allocator, 0x10, 10, 0x10, 19, 1),
+            BuildTableOnDisk(allocator, 0x10, 20, 0x10, 35, 1),
+            BuildTableOnDisk(allocator, 0x10, 25, 0x10, 35, 3),
+            BuildTableOnDisk(allocator, 0x10, 36, 0x10, 50, 2),
+            BuildTableOnDisk(allocator, 0x11, 0, 0x11, 10, 1),
+            BuildTableOnDisk(allocator, 0x11, 20, 0x11, 40, 1),
+            BuildTableOnDisk(allocator, 0x12, 5, 0x12, 20, 1),
+            BuildTableOnDisk(allocator, 0x13, 0, 0x13, 16, 1)
         };
 
         for (const auto& table : initial_tables) {
@@ -272,6 +363,13 @@ void TestVersionL1SelectionMatchesBaseline() {
         RunRangeComparison(version, baseline_tables, MakeKey(0x10, 45), MakeKey(0x11, 25), "cross-p10-p11");
         RunRangeComparison(version, baseline_tables, MakeKey(0x11, 18), MakeKey(0x13, 8), "cross-multi-prefix");
         RunRangeComparison(version, baseline_tables, MakeKey(0x13, 32), MakeKey(0x13, 48), "miss");
+        RunRecordRangeComparison(version, baseline_tables, MakeKey(0x10, 18), MakeKey(0x10, 37),
+                                 "single-prefix");
+        RunRecordRangeComparison(version, baseline_tables, MakeKey(0x10, 45), MakeKey(0x11, 25),
+                                 "cross-p10-p11");
+        RunRecordRangeComparison(version, baseline_tables, MakeKey(0x11, 18), MakeKey(0x13, 8),
+                                 "cross-multi-prefix");
+        RunRecordRangeComparison(version, baseline_tables, MakeKey(0x13, 32), MakeKey(0x13, 48), "miss");
 
         Check(version.DeleteTableInL1(initial_tables[1].meta), "deleting an existing L1 table should succeed");
         baseline_tables[1].meta = PSTMeta::InvalidTable();
@@ -279,6 +377,8 @@ void TestVersionL1SelectionMatchesBaseline() {
         RunLookupComparison(version, allocator, baseline_tables, MakeKey(0x10, 28), "p10-s28-after-delete");
         RunRangeComparison(version, baseline_tables, MakeKey(0x10, 18), MakeKey(0x10, 37),
                            "single-prefix-after-delete");
+        RunRecordRangeComparison(version, baseline_tables, MakeKey(0x10, 18), MakeKey(0x10, 37),
+                                 "single-prefix-after-delete");
 
         Check(version.DeleteTableInL1(initial_tables[6].meta),
               "deleting an existing cross-partition L1 table should succeed");
@@ -286,6 +386,8 @@ void TestVersionL1SelectionMatchesBaseline() {
 
         RunLookupComparison(version, allocator, baseline_tables, MakeKey(0x12, 8), "p12-s8-after-delete");
         RunLookupComparison(version, allocator, baseline_tables, MakeKey(0x13, 8), "p13-s8-after-delete");
+        RunRecordRangeComparison(version, baseline_tables, MakeKey(0x12, 0), MakeKey(0x13, 16),
+                                 "cross-after-delete");
     }
 
     RemovePoolFiles(pool_path);

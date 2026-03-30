@@ -46,3 +46,33 @@ add_test(NAME manifest_l1_snapshot_test
     COMMAND /bin/bash -lc "./manifest_l1_snapshot_test")
 set_tests_properties(manifest_l1_snapshot_test PROPERTIES
     WORKING_DIRECTORY ${PROJECT_BINARY_DIR}/tests)
+
+add_executable(manifest_batch_txn_replay_test
+    ${PROJECT_SOURCE_DIR}/tests/manifest_batch_txn_replay_test.cpp)
+
+target_link_libraries(manifest_batch_txn_replay_test flowkv)
+
+add_test(NAME manifest_batch_txn_replay_test
+    COMMAND /bin/bash -lc "./manifest_batch_txn_replay_test")
+set_tests_properties(manifest_batch_txn_replay_test PROPERTIES
+    WORKING_DIRECTORY ${PROJECT_BINARY_DIR}/tests)
+
+add_executable(manifest_durable_crash_recovery_smoke_test
+    ${PROJECT_SOURCE_DIR}/tests/manifest_durable_crash_recovery_smoke_test.cpp)
+
+target_link_libraries(manifest_durable_crash_recovery_smoke_test flowkv)
+
+add_test(NAME manifest_durable_crash_recovery_smoke_test
+    COMMAND /bin/bash -lc "./manifest_durable_crash_recovery_smoke_test")
+set_tests_properties(manifest_durable_crash_recovery_smoke_test PROPERTIES
+    WORKING_DIRECTORY ${PROJECT_BINARY_DIR}/tests)
+
+add_executable(manifest_durable_crash_fuzz_test
+    ${PROJECT_SOURCE_DIR}/tests/manifest_durable_crash_fuzz_test.cpp)
+
+target_link_libraries(manifest_durable_crash_fuzz_test flowkv)
+
+add_test(NAME manifest_durable_crash_fuzz_test
+    COMMAND /bin/bash -lc "./manifest_durable_crash_fuzz_test")
+set_tests_properties(manifest_durable_crash_fuzz_test PROPERTIES
+    WORKING_DIRECTORY ${PROJECT_BINARY_DIR}/tests)

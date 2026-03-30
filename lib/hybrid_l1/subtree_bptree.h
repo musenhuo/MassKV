@@ -40,7 +40,7 @@ public:
 
     struct BuildOptions {
         size_t leaf_capacity = 128;
-        size_t internal_fanout = 256;
+        size_t internal_fanout = 1000;
     };
     struct Node;
     struct LeafNode;
@@ -98,7 +98,7 @@ public:
         virtual ~Node() = default;
 
         bool is_leaf;
-        KeyType high_key{};
+        RouteSuffix high_key = 0;
     };
 
     struct LeafNode final : public Node {
@@ -110,7 +110,7 @@ public:
     struct InternalNode final : public Node {
         InternalNode() : Node(false) {}
 
-        std::vector<KeyType> high_keys;
+        std::vector<RouteSuffix> high_keys;
         std::vector<std::shared_ptr<const Node>> children;
     };
 

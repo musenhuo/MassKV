@@ -310,14 +310,15 @@ L1SubtreeBPTree::Cursor L1SubtreeBPTree::LowerBound(const KeyType& key) const {
 }
 
 bool L1SubtreeBPTree::LookupCandidate(const KeyType& key, SubtreeRecord& out) const {
+    const RouteSuffix suffix = ExtractSuffix(key);
     Cursor cursor = LowerBound(key);
     while (cursor.Valid()) {
         const auto& record = cursor.record();
-        if (record.Contains(key)) {
+        if (record.ContainsSuffix(suffix)) {
             out = record;
             return true;
         }
-        if (CompareKeyType(record.RouteMinKey(), key) > 0) {
+        if (record.route_min_suffix > suffix) {
             return false;
         }
         cursor.Next();
@@ -331,12 +332,13 @@ void L1SubtreeBPTree::LookupCandidates(const KeyType& key, size_t limit,
     if (limit == 0) {
         return;
     }
+    const RouteSuffix suffix = ExtractSuffix(key);
     Cursor cursor = LowerBound(key);
     while (cursor.Valid() && out.size() < limit) {
         const auto& record = cursor.record();
-        if (record.Contains(key)) {
+        if (record.ContainsSuffix(suffix)) {
             out.push_back(record);
-        } else if (CompareKeyType(record.RouteMinKey(), key) > 0) {
+        } else if (record.route_min_suffix > suffix) {
             break;
         }
         cursor.Next();
@@ -349,14 +351,16 @@ void L1SubtreeBPTree::RangeScan(const KeyType& start, const KeyType& end,
     if (CompareKeyType(start, end) > 0) {
         return;
     }
+    const RouteSuffix start_suffix = ExtractSuffix(start);
+    const RouteSuffix end_suffix = ExtractSuffix(end);
 
     Cursor cursor = LowerBound(start);
     while (cursor.Valid()) {
         const auto& record = cursor.record();
-        if (CompareKeyType(record.RouteMaxKey(), end) > 0 && CompareKeyType(record.RouteMinKey(), end) > 0) {
+        if (record.route_max_suffix > end_suffix && record.route_min_suffix > end_suffix) {
             break;
         }
-        if (KeyTypeLessEq(record.RouteMinKey(), end) && KeyTypeLessEq(start, record.RouteMaxKey())) {
+        if (record.route_min_suffix <= end_suffix && start_suffix <= record.route_max_suffix) {
             out.push_back(record);
         }
         cursor.Next();
@@ -390,7 +394,7 @@ bool L1SubtreeBPTree::Validate() const {
 
     size_t seen = 0;
     bool first = true;
-    KeyType last_max{};
+    RouteSuffix last_max = 0;
 
     for (size_t leaf_idx = 0; leaf_idx < leaves_.size(); ++leaf_idx) {
         const LeafNode* leaf = leaves_[leaf_idx].get();
@@ -408,13 +412,13 @@ bool L1SubtreeBPTree::Validate() const {
             if (!record.MatchesLocalFragment(record.route_prefix)) {
                 return false;
             }
-            if (record.route_prefix != ExtractPrefix(leaf->records.front().RouteMaxKey())) {
+            if (record.route_prefix != leaf->records.front().route_prefix) {
                 return false;
             }
-            if (!first && CompareKeyType(last_max, record.RouteMaxKey()) > 0) {
+            if (!first && last_max > record.route_max_suffix) {
                 return false;
             }
-            last_max = record.RouteMaxKey();
+            last_max = record.route_max_suffix;
             first = false;
             ++seen;
         }
@@ -471,8 +475,9 @@ L1SubtreeBPTree::Cursor L1SubtreeBPTree::LowerBoundInLeaf(const LeafNode* leaf,
     if (leaf == nullptr) {
         return Cursor();
     }
-    RecordRouteKeyLess less;
-    auto it = std::lower_bound(leaf->records.begin(), leaf->records.end(), key, less);
+    const RouteSuffix suffix = ExtractSuffix(key);
+    RecordRouteSuffixLess less;
+    auto it = std::lower_bound(leaf->records.begin(), leaf->records.end(), suffix, less);
     if (it != leaf->records.end()) {
         return MakeCursorFromLeafPosition(leaf, static_cast<size_t>(it - leaf->records.begin()));
     }
@@ -488,12 +493,12 @@ L1SubtreeBPTree::Cursor L1SubtreeBPTree::LowerBoundInLeaf(const LeafNode* leaf,
 }
 
 const L1SubtreeBPTree::LeafNode* L1SubtreeBPTree::DescendToLeaf(const KeyType& key) const {
+    const RouteSuffix suffix = ExtractSuffix(key);
     const Node* node = root_.get();
     while (node != nullptr && !node->is_leaf) {
         const auto* internal = static_cast<const InternalNode*>(node);
         auto it = std::lower_bound(
-            internal->high_keys.begin(), internal->high_keys.end(), key,
-            [](const KeyType& lhs, const KeyType& rhs) { return CompareKeyType(lhs, rhs) < 0; });
+            internal->high_keys.begin(), internal->high_keys.end(), suffix);
         size_t child_idx = it == internal->high_keys.end()
                                ? internal->children.size() - 1
                                : static_cast<size_t>(it - internal->high_keys.begin());
@@ -514,7 +519,7 @@ void L1SubtreeBPTree::BuildLeafLevel(const std::vector<SubtreeRecord>& sorted_re
         auto leaf = std::make_shared<LeafNode>();
         const size_t end = std::min(offset + options_.leaf_capacity, sorted_records.size());
         leaf->records.insert(leaf->records.end(), sorted_records.begin() + offset, sorted_records.begin() + end);
-        leaf->high_key = leaf->records.back().RouteMaxKey();
+        leaf->high_key = leaf->records.back().route_max_suffix;
         built_leaves.push_back(leaf);
         level_nodes.push_back(leaf);
     }
@@ -655,7 +660,7 @@ L1SubtreeBPTree::MemoryUsageStats L1SubtreeBPTree::EstimateMemoryUsage() const {
             stats.vector_overhead_bytes += sizeof(std::vector<KeyType>);
             stats.vector_overhead_bytes += sizeof(std::vector<std::shared_ptr<const Node>>);
             stats.vector_overhead_bytes +=
-                internal->high_keys.capacity() * sizeof(KeyType) +
+                internal->high_keys.capacity() * sizeof(RouteSuffix) +
                 internal->children.capacity() * sizeof(std::shared_ptr<const Node>);
             for (const auto& child : internal->children) {
                 walk(child);

@@ -48,6 +48,8 @@ def main():
     make_plot(rows, "avg_latency_ns", "Average Latency (ns)", plot_dir / "avg_latency_ns.png")
     make_plot(rows, "p99_latency_ns", "P99 Latency (ns)", plot_dir / "p99_latency_ns.png")
     make_plot(rows, "l1_index_bytes_estimated", "L1 Index Memory (bytes)", plot_dir / "l1_index_bytes_estimated.png")
+    if rows and "l1_index_bytes_measured" in rows[0]:
+        make_plot(rows, "l1_index_bytes_measured", "L1 Index Memory Measured (bytes)", plot_dir / "l1_index_bytes_measured.png")
 
 
 if __name__ == "__main__":

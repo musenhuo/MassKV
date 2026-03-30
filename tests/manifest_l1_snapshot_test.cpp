@@ -73,7 +73,7 @@ void TestSnapshotRoundTripAndChecksumGuard() {
         Check(loaded_payload == expected_payload, "recovered payload mismatch");
 
         constexpr off_t kHybridStateStart =
-            static_cast<off_t>(4096 + L0MetaSize + L1MetaSize + OpLogSize);
+            static_cast<off_t>(4096 + L0MetaSize + L1MetaSize + FlushLogSize);
         uint8_t flipped = 0;
         const ssize_t read_ret = pread(fd, &flipped, 1, kHybridStateStart + 32);
         Check(read_ret == 1, "read snapshot byte for corruption should succeed");
@@ -93,7 +93,7 @@ void TestSnapshotRoundTripAndChecksumGuard() {
 void TestSnapshotDualSlotAtomicSwitch() {
     constexpr uint32_t kSeqNo = 0x4567ABCDu;
     constexpr off_t kHybridStateStart =
-        static_cast<off_t>(4096 + L0MetaSize + L1MetaSize + OpLogSize);
+        static_cast<off_t>(4096 + L0MetaSize + L1MetaSize + FlushLogSize);
     constexpr size_t kHybridSlotBytes = L1HybridStateSize / 2;
     const std::string path = MakeTempManifestPath();
     RemovePath(path);

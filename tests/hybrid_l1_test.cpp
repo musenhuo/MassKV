@@ -1,8 +1,12 @@
 #include "lib/hybrid_l1/subtree_bptree.h"
 #include "lib/hybrid_l1/l1_hybrid_index.h"
+#include "lib/hybrid_l1/normal_pack.h"
 #include "lib/hybrid_l1/prefix_suffix.h"
+#include "lib/hybrid_l1/route_layout.h"
+#include "lib/hybrid_l1/route_descriptor.h"
 #include "lib/hybrid_l1/subtree_page.h"
 #include "lib/hybrid_l1/subtree_page_store.h"
+#include "db/allocator/segment_allocator.h"
 
 #include <cstdlib>
 #include <exception>
@@ -17,7 +21,20 @@
 
 using flowkv::hybrid_l1::L1SubtreeBPTree;
 using flowkv::hybrid_l1::L1HybridIndex;
+using flowkv::hybrid_l1::NormalPackCodec;
+using flowkv::hybrid_l1::NormalPackEntry;
+using flowkv::hybrid_l1::NormalPackPage;
+using flowkv::hybrid_l1::NormalPackSlot;
+using flowkv::hybrid_l1::RangeScanRecordOptions;
+using flowkv::hybrid_l1::RangeScanRecordResult;
 using flowkv::hybrid_l1::SubtreeRecord;
+using flowkv::hybrid_l1::RoutePartition;
+using flowkv::hybrid_l1::RouteSnapshotEntry;
+using flowkv::hybrid_l1::RouteSwapOptions;
+using flowkv::hybrid_l1::RouteDescriptor;
+using flowkv::hybrid_l1::RouteDescriptorMode;
+using flowkv::hybrid_l1::FixedRouteLayout;
+using flowkv::hybrid_l1::kInvalidSubtreePagePtr;
 using flowkv::hybrid_l1::SubtreePageCodec;
 using flowkv::hybrid_l1::SubtreePageStore;
 using flowkv::hybrid_l1::ExtractPrefix;
@@ -83,6 +100,35 @@ SubtreeRecord MakeRecordWithPrefix(uint64_t prefix,
     record.table_idx = table_idx;
     record.seq_no = seq_no;
     return record;
+}
+
+std::string MakeTempPoolPath(const std::string& test_name) {
+    return std::string("/tmp/") + test_name + "_" + std::to_string(getpid()) + ".pool";
+}
+
+void RemovePoolFiles(const std::string& pool_path) {
+    std::error_code ec;
+    std::filesystem::remove(pool_path, ec);
+    std::filesystem::remove(pool_path + ".manifest", ec);
+}
+
+struct ScopedAllocatorPool {
+    std::string pool_path;
+    SegmentAllocator allocator;
+
+    explicit ScopedAllocatorPool(const std::string& test_name, uint64_t pool_size = 32 * SEGMENT_SIZE)
+        : pool_path(MakeTempPoolPath(test_name)),
+          allocator((RemovePoolFiles(pool_path), pool_path), pool_size, false, false) {}
+
+    ~ScopedAllocatorPool() { RemovePoolFiles(pool_path); }
+};
+
+L1HybridIndex::BuildOptions MakeDiskHybridOptions(SegmentAllocator& allocator) {
+    L1HybridIndex::BuildOptions options;
+    options.route_partition_num = 2;
+    options.subtree_options = {2, 2};
+    options.segment_allocator = &allocator;
+    return options;
 }
 
 void TestBulkLoadAndExport() {
@@ -475,24 +521,14 @@ void TestSubtreePageCowPersistenceRoundTrip() {
     {
         SegmentAllocator allocator(pool_path.string(), 16 * SEGMENT_SIZE, false, false);
         const auto base_handle = SubtreePageStore::Persist(allocator, base_page_set);
+        flowkv::hybrid_l1::SubtreeCowStats cow_stats;
         const auto cow_handle =
-            SubtreePageStore::PersistCow(allocator, base_handle, base_page_set, target_page_set);
+            SubtreePageStore::PersistCow(allocator, base_handle, base_page_set, target_page_set, &cow_stats);
         Check(cow_handle.Valid(), "cow handle should be valid");
-        Check(cow_handle.pages.size() == target_page_set.pages.size() + 1,
+        Check(cow_handle.page_count == target_page_set.pages.size(),
               "cow handle page count mismatch");
-
-        std::unordered_set<uint64_t> base_page_refs;
-        for (const auto& ref : base_handle.pages) {
-            base_page_refs.insert((ref.segment_id << 32) ^ ref.page_id);
-        }
-        size_t shared_pages = 0;
-        for (const auto& ref : cow_handle.pages) {
-            if (base_page_refs.find((ref.segment_id << 32) ^ ref.page_id) != base_page_refs.end()) {
-                ++shared_pages;
-            }
-        }
-        Check(shared_pages > 0, "cow handle should reuse at least one page");
-        Check(shared_pages < cow_handle.pages.size(), "cow handle should rewrite at least one page");
+        Check(cow_stats.reused_pages > 0, "cow handle should reuse at least one page");
+        Check(cow_stats.written_pages > 0, "cow handle should rewrite at least one page");
 
         auto loaded = SubtreePageStore::Load(allocator, cow_handle);
         Check(SubtreePageCodec::Validate(loaded), "cow loaded page set should validate");
@@ -542,7 +578,9 @@ void TestCowReusesInteriorLeavesAndInternalNodes() {
 }
 
 void TestHybridIndexPrefixLookup() {
-    L1HybridIndex index({2, {2, 2}});
+    ScopedAllocatorPool pool("flowkv_hybrid_l1_prefix_lookup");
+    auto options = MakeDiskHybridOptions(pool.allocator);
+    L1HybridIndex index(options);
     index.BulkLoad({
         MakeRecordWithPrefix(0x10, 0x10, 0x20, 100),
         MakeRecordWithPrefix(0x10, 0x18, 0x28, 101),
@@ -566,7 +604,9 @@ void TestHybridIndexPrefixLookup() {
 }
 
 void TestHybridIndexPrefixRangeScan() {
-    L1HybridIndex index({2, {2, 2}});
+    ScopedAllocatorPool pool("flowkv_hybrid_l1_prefix_range");
+    auto options = MakeDiskHybridOptions(pool.allocator);
+    L1HybridIndex index(options);
     index.BulkLoad({
         MakeRecordWithPrefix(0x10, 0x10, 0x1f, 100),
         MakeRecordWithPrefix(0x10, 0x18, 0x28, 101),
@@ -580,6 +620,132 @@ void TestHybridIndexPrefixRangeScan() {
     Check(out[0].table_idx == 100, "range scan first candidate mismatch");
     Check(out[1].table_idx == 101, "range scan second candidate mismatch");
     Check(out[2].table_idx == 102, "range scan third candidate mismatch");
+}
+
+void TestHybridIndexRouteSwapColdStubFallback() {
+    ScopedAllocatorPool pool("flowkv_hybrid_l1_route_swap");
+    auto hot_options = MakeDiskHybridOptions(pool.allocator);
+    auto swap_options = MakeDiskHybridOptions(pool.allocator);
+    swap_options.route_hot_leaf_budget_bytes = 64;  // force cold swap
+
+    L1HybridIndex hot_index(hot_options);
+    L1HybridIndex swap_index(swap_options);
+    std::vector<SubtreeRecord> records = {
+        MakeRecordWithPrefix(0x80, 0x00, 0x10, 100),
+        MakeRecordWithPrefix(0x81, 0x00, 0x10, 101),
+        MakeRecordWithPrefix(0x82, 0x00, 0x10, 102),
+        MakeRecordWithPrefix(0x83, 0x00, 0x10, 103),
+        MakeRecordWithPrefix(0x84, 0x00, 0x10, 104),
+    };
+
+    hot_index.BulkLoad(records);
+    swap_index.BulkLoad(records);
+    Check(hot_index.Validate(), "hot route index should validate");
+    Check(swap_index.Validate(), "swapped route index should validate");
+
+    SubtreeRecord out;
+    Check(swap_index.LookupCandidate(MakeKey(0x82, 0x08), out),
+          "cold snapshot fallback should serve point lookup");
+    Check(out.table_idx == 102, "cold snapshot fallback point lookup mismatch");
+
+    std::vector<SubtreeRecord> range_out;
+    swap_index.RangeScan(MakeKey(0x81, 0x08), MakeKey(0x83, 0x08), range_out);
+    Check(range_out.size() == 3, "cold snapshot fallback should serve range scan across prefixes");
+    Check(range_out[0].table_idx == 101, "cold snapshot range first record mismatch");
+    Check(range_out[1].table_idx == 102, "cold snapshot range second record mismatch");
+    Check(range_out[2].table_idx == 103, "cold snapshot range third record mismatch");
+
+    const auto hot_stats = hot_index.EstimateMemoryUsage();
+    const auto swap_stats = swap_index.EstimateMemoryUsage();
+    Check(swap_stats.route_hot_descriptor_index_measured_bytes <=
+              hot_stats.route_hot_descriptor_index_measured_bytes,
+          "swap mode should not increase hot masstree measured bytes");
+}
+
+void TestRouteLayoutCollectDescriptorsForRangeHotEntries() {
+#if !defined(FLOWKV_KEY16)
+    return;
+#else
+    FixedRouteLayout layout(/*route_partition_num=*/8, RouteSwapOptions{});
+    std::vector<RoutePartition> partitions;
+
+    RoutePartition tiny;
+    tiny.prefix = 0x30;
+    tiny.descriptor_mode = RouteDescriptorMode::kTinyDirect;
+    tiny.tiny_leaf_value = SubtreeRecord::PackLeafValue(/*kv_block_ptr=*/0x1234, /*offset=*/7, /*count=*/3);
+    partitions.push_back(tiny);
+
+    RoutePartition pack;
+    pack.prefix = 0x31;
+    pack.descriptor_mode = RouteDescriptorMode::kNormalPack;
+    pack.pack_page_ptr = 0x4000;  // 4KB aligned and non-zero
+    pack.pack_slot_id = 2;
+    partitions.push_back(pack);
+
+    RoutePartition subtree;
+    subtree.prefix = 0x32;
+    subtree.descriptor_mode = RouteDescriptorMode::kNormalSubtree;
+    subtree.subtree_store.root_page_ptr = 0x8000;
+    partitions.push_back(subtree);
+
+    layout.RefreshPartitions(partitions);
+
+    std::vector<RouteSnapshotEntry> entries;
+    layout.CollectDescriptorsForRange(MakeKey(0x30, 0), MakeKey(0x32, UINT64_MAX), entries);
+    Check(entries.size() == 3, "descriptor range scan should include tiny/pack/subtree entries");
+    Check(entries[0].prefix == 0x30, "descriptor range first prefix mismatch");
+    Check(entries[1].prefix == 0x31, "descriptor range second prefix mismatch");
+    Check(entries[2].prefix == 0x32, "descriptor range third prefix mismatch");
+    Check(entries[0].descriptor == RouteDescriptor::EncodeTinyLeafValue(tiny.tiny_leaf_value),
+          "tiny descriptor mismatch");
+    Check(entries[1].descriptor == RouteDescriptor::EncodeNormalPack(pack.pack_page_ptr, pack.pack_slot_id),
+          "pack descriptor mismatch");
+    Check(entries[2].descriptor == RouteDescriptor::EncodeNormalSubtree(subtree.subtree_store.root_page_ptr),
+          "subtree descriptor mismatch");
+    Check(entries[0].root_page_ptr == kInvalidSubtreePagePtr,
+          "tiny descriptor should not expose subtree root");
+    Check(entries[1].root_page_ptr == kInvalidSubtreePagePtr,
+          "pack descriptor should not expose subtree root");
+    Check(entries[2].root_page_ptr == subtree.subtree_store.root_page_ptr,
+          "subtree descriptor should expose root pointer");
+#endif
+}
+
+void TestRouteLayoutCollectDescriptorsForRangeIncludesColdEntries() {
+#if !defined(FLOWKV_KEY16)
+    return;
+#else
+    ScopedAllocatorPool pool("flowkv_route_layout_collect_desc_cold");
+    RouteSwapOptions swap_options;
+    swap_options.hot_leaf_budget_bytes = 64;  // force swapping
+    swap_options.segment_allocator = &pool.allocator;
+    FixedRouteLayout layout(/*route_partition_num=*/16, swap_options);
+
+    std::vector<RoutePartition> partitions;
+    std::vector<uint64_t> expected_descriptors;
+    constexpr uint64_t kPrefixCount = 128;
+    for (uint64_t i = 0; i < kPrefixCount; ++i) {
+        RoutePartition part;
+        part.prefix = 0x80 + i;
+        part.descriptor_mode = RouteDescriptorMode::kNormalSubtree;
+        part.subtree_store.root_page_ptr = 0x10000 + i * 0x1000;
+        partitions.push_back(part);
+        expected_descriptors.push_back(RouteDescriptor::EncodeNormalSubtree(part.subtree_store.root_page_ptr));
+    }
+
+    layout.RefreshPartitions(partitions);
+    Check(layout.ColdStubCount() > 0, "cold-swap test should produce cold stubs");
+
+    std::vector<RouteSnapshotEntry> entries;
+    layout.CollectDescriptorsForRange(MakeKey(0x80, 0),
+                                      MakeKey(0x80 + kPrefixCount - 1, UINT64_MAX),
+                                      entries);
+    Check(entries.size() == partitions.size(), "descriptor range scan should include all cold prefixes");
+    for (size_t i = 0; i < entries.size(); ++i) {
+        Check(entries[i].prefix == partitions[i].prefix, "cold descriptor prefix order mismatch");
+        Check(entries[i].descriptor == expected_descriptors[i], "cold descriptor payload mismatch");
+    }
+#endif
 }
 
 void TestHybridIndexDiskPointLookupUsesPagePath() {
@@ -680,8 +846,17 @@ void TestHybridIndexDiskRangeScanUsesPagePath() {
 }
 
 void TestHybridIndexParallelRangeScanMatchesSerial() {
-    L1HybridIndex serial_index({2, {2, 2}, {}, false, 3, 4});
-    L1HybridIndex parallel_index({2, {2, 2}, {}, true, 2, 3});
+    ScopedAllocatorPool pool("flowkv_hybrid_l1_parallel_range");
+    auto serial_options = MakeDiskHybridOptions(pool.allocator);
+    serial_options.enable_parallel_range_scan = false;
+    serial_options.parallel_scan_min_partitions = 3;
+    serial_options.parallel_scan_max_tasks = 4;
+    auto parallel_options = MakeDiskHybridOptions(pool.allocator);
+    parallel_options.enable_parallel_range_scan = true;
+    parallel_options.parallel_scan_min_partitions = 2;
+    parallel_options.parallel_scan_max_tasks = 3;
+    L1HybridIndex serial_index(serial_options);
+    L1HybridIndex parallel_index(parallel_options);
 
     std::vector<SubtreeRecord> records = {
         MakeRecordWithPrefix(0x70, 0x10, 0x30, 100),
@@ -708,9 +883,134 @@ void TestHybridIndexParallelRangeScanMatchesSerial() {
     }
 }
 
+void TestHybridIndexRangeScanRecordsCoversDescriptorModes() {
+#if !defined(FLOWKV_KEY16)
+    return;
+#else
+    ScopedAllocatorPool pool("flowkv_hybrid_l1_range_scan_records_modes");
+    auto options = MakeDiskHybridOptions(pool.allocator);
+    options.enable_parallel_range_scan = false;
+    L1HybridIndex index(options);
+
+    SubtreeRecord subtree_seed = MakeRecordWithPrefix(0x52, 0x10, 0x30, 200);
+    subtree_seed.SetLeafWindowByBlockPtr(/*kv_block_ptr=*/0x333, /*offset=*/5, /*count=*/4);
+    index.BulkLoad({subtree_seed});
+    Check(index.Validate(), "range-scan-records baseline index should validate");
+
+    std::vector<RoutePartition> persisted_partitions;
+    size_t logical_size = 0;
+    uint64_t generation = 0;
+    index.ExportPersistedState(persisted_partitions, logical_size, generation);
+    Check(persisted_partitions.size() == 1, "baseline persisted state should have one subtree prefix");
+
+    NormalPackPage pack_page;
+    NormalPackSlot slot;
+    slot.prefix = 0x51;
+    slot.entry_begin = 0;
+    slot.entry_count = 2;
+    pack_page.slots.push_back(slot);
+
+    NormalPackEntry pack_entry_a;
+    pack_entry_a.suffix_min = 0x00;
+    pack_entry_a.suffix_max = 0x08;
+    pack_entry_a.leaf_value = SubtreeRecord::PackLeafValue(/*kv_block_ptr=*/0x222, /*offset=*/2, /*count=*/3);
+    pack_page.entries.push_back(pack_entry_a);
+
+    NormalPackEntry pack_entry_b;
+    pack_entry_b.suffix_min = 0x20;
+    pack_entry_b.suffix_max = 0x40;
+    pack_entry_b.leaf_value = SubtreeRecord::PackLeafValue(/*kv_block_ptr=*/0x224, /*offset=*/7, /*count=*/5);
+    pack_page.entries.push_back(pack_entry_b);
+
+    std::vector<uint8_t> pack_bytes;
+    Check(NormalPackCodec::Encode(pack_page, options.subtree_page_size, pack_bytes),
+          "normal-pack encode should succeed");
+    auto pack_ptrs = SubtreePageStore::PersistOpaquePages(pool.allocator,
+                                                          options.subtree_page_size,
+                                                          {pack_bytes});
+    Check(pack_ptrs.size() == 1, "normal-pack persist should return exactly one page ptr");
+
+    RoutePartition tiny_partition;
+    tiny_partition.prefix = 0x50;
+    tiny_partition.descriptor_mode = RouteDescriptorMode::kTinyDirect;
+    tiny_partition.tiny_leaf_value =
+        SubtreeRecord::PackLeafValue(/*kv_block_ptr=*/0x111, /*offset=*/1, /*count=*/3);
+
+    RoutePartition pack_partition;
+    pack_partition.prefix = 0x51;
+    pack_partition.descriptor_mode = RouteDescriptorMode::kNormalPack;
+    pack_partition.pack_page_ptr = pack_ptrs[0];
+    pack_partition.pack_slot_id = 0;
+
+    RoutePartition subtree_partition = persisted_partitions.front();
+    Check(subtree_partition.prefix == 0x52, "baseline subtree prefix mismatch");
+
+    std::vector<RoutePartition> mixed_partitions = {
+        tiny_partition,
+        pack_partition,
+        subtree_partition,
+    };
+    Check(index.ImportPersistedState(mixed_partitions, logical_size, generation + 1),
+          "mixed descriptor persisted state import should succeed");
+    Check(index.Validate(), "mixed descriptor index should validate");
+
+    RangeScanRecordOptions scan_options;
+    scan_options.include_window_fragments = true;
+    scan_options.include_unique_blocks = true;
+    scan_options.dedup_windows = true;
+
+    RangeScanRecordResult scan_result;
+    index.RangeScanRecords(MakeKey(0x50, 0x04), MakeKey(0x52, 0x25), scan_options, scan_result);
+
+    Check(scan_result.window_fragments.size() == 4,
+          "range-scan-records should expose tiny/pack/subtree windows");
+    Check(scan_result.window_fragments[0].route_prefix == 0x50,
+          "first fragment should come from tiny descriptor");
+    Check(scan_result.window_fragments[0].route_min_suffix == 0x04,
+          "tiny fragment should be clipped by start suffix");
+    Check(scan_result.window_fragments[0].leaf_value == tiny_partition.tiny_leaf_value,
+          "tiny fragment leaf window mismatch");
+
+    Check(scan_result.window_fragments[1].route_prefix == 0x51,
+          "second fragment should come from normal-pack descriptor");
+    Check(scan_result.window_fragments[1].route_min_suffix == 0x00 &&
+              scan_result.window_fragments[1].route_max_suffix == 0x08,
+          "normal-pack first fragment bounds mismatch");
+    Check(scan_result.window_fragments[2].route_prefix == 0x51,
+          "third fragment should come from normal-pack descriptor");
+    Check(scan_result.window_fragments[2].route_min_suffix == 0x20 &&
+              scan_result.window_fragments[2].route_max_suffix == 0x40,
+          "normal-pack second fragment bounds mismatch");
+    Check(scan_result.window_fragments[3].route_prefix == 0x52,
+          "fourth fragment should come from normal-subtree descriptor");
+    Check(scan_result.window_fragments[3].table_idx == 200,
+          "normal-subtree fragment should preserve original table_idx");
+    Check(scan_result.window_fragments[3].LeafWindow().count == 0,
+          "normal-subtree fragment in this synthetic fixture should have empty leaf window");
+
+    const std::vector<uint64_t> expected_blocks = {0x111, 0x222, 0x224};
+    Check(scan_result.unique_kv_block_ptrs == expected_blocks,
+          "range-scan-records unique kv block pointers mismatch");
+
+    RangeScanRecordOptions block_only_options;
+    block_only_options.include_window_fragments = false;
+    block_only_options.include_unique_blocks = true;
+    block_only_options.dedup_windows = false;
+    RangeScanRecordResult block_only_result;
+    index.RangeScanRecords(MakeKey(0x50, 0x04), MakeKey(0x52, 0x25),
+                           block_only_options, block_only_result);
+    Check(block_only_result.window_fragments.empty(),
+          "block-only range-scan-records should not output window fragments");
+    Check(block_only_result.unique_kv_block_ptrs == expected_blocks,
+          "block-only range-scan-records unique blocks mismatch");
+#endif
+}
+
 void TestHybridIndexLightweightGovernance() {
+    ScopedAllocatorPool pool("flowkv_hybrid_l1_governance");
     L1HybridIndex::BuildOptions options;
     options.subtree_options = {2, 2};
+    options.segment_allocator = &pool.allocator;
     options.enable_parallel_range_scan = true;
     options.parallel_scan_min_partitions = 4;
     options.parallel_scan_max_tasks = 3;
@@ -745,7 +1045,9 @@ void TestHybridIndexLightweightGovernance() {
 }
 
 void TestHybridIndexKeepsSameMaxKeyTogether() {
-    L1HybridIndex index({2, {2, 2}});
+    ScopedAllocatorPool pool("flowkv_hybrid_l1_same_max");
+    auto options = MakeDiskHybridOptions(pool.allocator);
+    L1HybridIndex index(options);
     index.BulkLoad({
         MakeRecordWithPrefix(0x20, 0x00, 0x10, 101, 3),
         MakeRecordWithPrefix(0x20, 0x00, 0x10, 102, 2),
@@ -764,7 +1066,9 @@ void TestHybridIndexKeepsSameMaxKeyTogether() {
 }
 
 void TestHybridIndexPartialPartitionRebuild() {
-    L1HybridIndex index({2, {2, 2}});
+    ScopedAllocatorPool pool("flowkv_hybrid_l1_partial_rebuild");
+    auto options = MakeDiskHybridOptions(pool.allocator);
+    L1HybridIndex index(options);
     std::vector<TaggedPstMeta> tables(4);
 
     tables[0].meta.datablock_ptr_ = 1000;
@@ -809,7 +1113,9 @@ void TestHybridIndexPartialPartitionRebuild() {
 }
 
 void TestHybridIndexDelayedReclamation() {
-    L1HybridIndex index({2, {2, 2}});
+    ScopedAllocatorPool pool("flowkv_hybrid_l1_reclaim");
+    auto options = MakeDiskHybridOptions(pool.allocator);
+    L1HybridIndex index(options);
     std::vector<TaggedPstMeta> tables(2);
 
     tables[0].meta.datablock_ptr_ = 1000;
@@ -865,9 +1171,13 @@ int main() {
         TestCowReusesInteriorLeavesAndInternalNodes();
         TestHybridIndexPrefixLookup();
         TestHybridIndexPrefixRangeScan();
+        TestHybridIndexRouteSwapColdStubFallback();
+        TestRouteLayoutCollectDescriptorsForRangeHotEntries();
+        TestRouteLayoutCollectDescriptorsForRangeIncludesColdEntries();
         TestHybridIndexDiskPointLookupUsesPagePath();
         TestHybridIndexDiskRangeScanUsesPagePath();
         TestHybridIndexParallelRangeScanMatchesSerial();
+        TestHybridIndexRangeScanRecordsCoversDescriptorModes();
         TestHybridIndexLightweightGovernance();
         TestHybridIndexKeepsSameMaxKeyTogether();
         TestHybridIndexPartialPartitionRebuild();

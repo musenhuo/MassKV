@@ -4,6 +4,8 @@
 #include "db/pst_builder.h"
 #include "db/pst_reader.h"
 #include "db/pst_deleter.h"
+#include "lib/hybrid_l1/subtree_record.h"
+#include <cstdint>
 #include <vector>
 
 class Version;
@@ -18,8 +20,14 @@ private:
     PSTBuilder pst_builder_;
     PSTDeleter pst_deleter_;
     const unsigned output_seq_no_;
+    bool use_l1_range_scan_records_ = true;
+    bool use_l1_delete_covered_only_ = true;
 
     std::vector<std::vector<TaggedPstMeta>> inputs_;
+    std::vector<flowkv::hybrid_l1::SubtreeRecord> inputs_l1_records_;
+    std::vector<uint64_t> inputs_l1_unique_blocks_;
+    std::vector<flowkv::hybrid_l1::SubtreeRecord> add_patch_records_;
+    std::vector<flowkv::hybrid_l1::SubtreeRecord> partition_add_patch_records_[RANGE_PARTITION_NUM];
     std::vector<TaggedPstMeta> outputs_;
 	std::vector<TaggedPstMeta> partition_outputs_[RANGE_PARTITION_NUM];
 

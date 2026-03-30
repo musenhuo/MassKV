@@ -33,6 +33,7 @@ using flowkv::hybrid_l1::RouteSuffix;
 enum class Distribution {
     kUniform,
     kPrefixSkew,
+    kPrefixSkewExtreme,
 };
 
 struct Config {
@@ -82,8 +83,14 @@ struct Metrics {
     double avg_io_pst_reads_top1pct_latency = 0.0;
     size_t rss_bytes = 0;
     size_t l1_index_bytes_estimated = 0;
+    size_t l1_index_bytes_measured = 0;
     size_t l1_route_partition_bytes = 0;
     size_t l1_route_index_estimated_bytes = 0;
+    size_t l1_route_index_measured_bytes = 0;
+    size_t l1_route_hot_root_index_measured_bytes = 0;
+    size_t l1_route_hot_descriptor_index_measured_bytes = 0;
+    size_t l1_route_cold_stub_count = 0;
+    size_t l1_route_cold_ssd_bytes = 0;
     size_t l1_subtree_bytes = 0;
     size_t l1_subtree_cache_bytes = 0;
     size_t l1_governance_bytes = 0;
@@ -121,6 +128,9 @@ Distribution ParseDistribution(const std::string& text) {
     if (text == "prefix-skew") {
         return Distribution::kPrefixSkew;
     }
+    if (text == "prefix-skew-extreme") {
+        return Distribution::kPrefixSkewExtreme;
+    }
     Fail("unsupported distribution: " + text);
 }
 
@@ -128,7 +138,10 @@ flowkv::experiments::PrefixDistribution ToPrefixDistribution(Distribution dist) 
     if (dist == Distribution::kUniform) {
         return flowkv::experiments::PrefixDistribution::kUniform;
     }
-    return flowkv::experiments::PrefixDistribution::kPrefixSkew;
+    if (dist == Distribution::kPrefixSkew) {
+        return flowkv::experiments::PrefixDistribution::kPrefixSkew;
+    }
+    return flowkv::experiments::PrefixDistribution::kPrefixSkewExtreme;
 }
 
 size_t ParseSize(const std::string& text) {
@@ -276,8 +289,12 @@ size_t UsedCountForPrefix(const Config& cfg, Distribution dist, RoutePrefix pref
         return prefix < rem ? base + 1 : base;
     }
 
-    const size_t hot_prefixes = std::max<size_t>(1, cfg.prefix_count / 5);
-    const size_t hot_keys = cfg.key_count * 80 / 100;
+    size_t hot_prefixes = std::max<size_t>(1, cfg.prefix_count / 5);
+    size_t hot_keys = cfg.key_count * 80 / 100;
+    if (dist == Distribution::kPrefixSkewExtreme) {
+        hot_prefixes = std::max<size_t>(1, cfg.prefix_count / 100);
+        hot_keys = cfg.key_count * 99 / 100;
+    }
     const size_t cold_keys = cfg.key_count - hot_keys;
     if (prefix < hot_prefixes) {
         const size_t base = hot_keys / hot_prefixes;
@@ -302,8 +319,12 @@ KeyType KeyForLogicalIndex(const Config& cfg, Distribution dist, size_t logical_
         return ComposeKey(prefix, suffix);
     }
 
-    const size_t hot_prefixes = std::max<size_t>(1, cfg.prefix_count / 5);
-    const size_t hot_keys = cfg.key_count * 80 / 100;
+    size_t hot_prefixes = std::max<size_t>(1, cfg.prefix_count / 5);
+    size_t hot_keys = cfg.key_count * 80 / 100;
+    if (dist == Distribution::kPrefixSkewExtreme) {
+        hot_prefixes = std::max<size_t>(1, cfg.prefix_count / 100);
+        hot_keys = cfg.key_count * 99 / 100;
+    }
     if (logical_idx < hot_keys) {
         const RoutePrefix prefix = static_cast<RoutePrefix>(logical_idx % hot_prefixes);
         const RouteSuffix suffix = static_cast<RouteSuffix>(logical_idx / hot_prefixes);
@@ -495,7 +516,16 @@ Metrics RunQueries(const Config& cfg,
                     std::chrono::duration_cast<std::chrono::nanoseconds>(finish - start).count());
                 traces[i].l1_page_reads = l1_read_after - l1_read_before;
                 traces[i].pst_reads = pst_read_after - pst_read_before;
-                Check(found == queries[i].expect_hit, "point query hit/miss mismatch");
+                if (found != queries[i].expect_hit) {
+                    std::cerr << "hit/miss mismatch for prefix=" << ExtractPrefix(queries[i].key)
+                              << " suffix=" << flowkv::hybrid_l1::ExtractSuffix(queries[i].key)
+                              << " expect_hit=" << (queries[i].expect_hit ? 1 : 0)
+                              << " found=" << (found ? 1 : 0)
+                              << " l1_reads=" << traces[i].l1_page_reads
+                              << " pst_reads=" << traces[i].pst_reads
+                              << std::endl;
+                    Fail("point query hit/miss mismatch");
+                }
                 if (found) {
                     FixedValue16 actual_value{};
                     std::memcpy(&actual_value, value_buf.data(), sizeof(actual_value));
@@ -576,9 +606,16 @@ Metrics RunQueries(const Config& cfg,
     metrics.avg_io_pst_reads_per_query = avg_pst_reads;
     metrics.avg_io_pst_reads_top1pct_latency = top1_avg_pst_reads;
     metrics.rss_bytes = rss_before;
-    metrics.l1_index_bytes_estimated = l1_memory.TotalBytes();
+    metrics.l1_index_bytes_estimated = l1_memory.ReadPathBytes();
+    metrics.l1_index_bytes_measured = l1_memory.ReadPathMeasuredBytes();
     metrics.l1_route_partition_bytes = l1_memory.route_partition_bytes;
     metrics.l1_route_index_estimated_bytes = l1_memory.route_index_estimated_bytes;
+    metrics.l1_route_index_measured_bytes = l1_memory.route_index_measured_bytes;
+    metrics.l1_route_hot_root_index_measured_bytes = l1_memory.route_hot_root_index_measured_bytes;
+    metrics.l1_route_hot_descriptor_index_measured_bytes =
+        l1_memory.route_hot_descriptor_index_measured_bytes;
+    metrics.l1_route_cold_stub_count = l1_memory.route_cold_stub_count;
+    metrics.l1_route_cold_ssd_bytes = l1_memory.route_cold_ssd_bytes;
     metrics.l1_subtree_bytes = l1_memory.subtree_bytes;
     metrics.l1_subtree_cache_bytes = l1_memory.subtree_cache_bytes;
     metrics.l1_governance_bytes = l1_memory.governance_bytes;
@@ -638,8 +675,16 @@ void PrintMetrics(const Config& cfg, const Metrics& metrics) {
     std::cout << "avg_io_pst_reads_top1pct_latency=" << metrics.avg_io_pst_reads_top1pct_latency << "\n";
     std::cout << "rss_bytes=" << metrics.rss_bytes << "\n";
     std::cout << "l1_index_bytes_estimated=" << metrics.l1_index_bytes_estimated << "\n";
+    std::cout << "l1_index_bytes_measured=" << metrics.l1_index_bytes_measured << "\n";
     std::cout << "l1_route_partition_bytes=" << metrics.l1_route_partition_bytes << "\n";
     std::cout << "l1_route_index_estimated_bytes=" << metrics.l1_route_index_estimated_bytes << "\n";
+    std::cout << "l1_route_index_measured_bytes=" << metrics.l1_route_index_measured_bytes << "\n";
+    std::cout << "l1_route_hot_root_index_measured_bytes="
+              << metrics.l1_route_hot_root_index_measured_bytes << "\n";
+    std::cout << "l1_route_hot_descriptor_index_measured_bytes="
+              << metrics.l1_route_hot_descriptor_index_measured_bytes << "\n";
+    std::cout << "l1_route_cold_stub_count=" << metrics.l1_route_cold_stub_count << "\n";
+    std::cout << "l1_route_cold_ssd_bytes=" << metrics.l1_route_cold_ssd_bytes << "\n";
     std::cout << "l1_subtree_bytes=" << metrics.l1_subtree_bytes << "\n";
     std::cout << "l1_subtree_cache_bytes=" << metrics.l1_subtree_cache_bytes << "\n";
     std::cout << "l1_governance_bytes=" << metrics.l1_governance_bytes << "\n";

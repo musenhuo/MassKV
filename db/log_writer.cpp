@@ -180,6 +180,16 @@ void LogWriter::PersistNowSegment()
     current_segment_ = nullptr;
 }
 
+bool LogWriter::PersistNowSegmentIfGroup(int log_segment_group_id)
+{
+    if (log_segment_group_id_ != log_segment_group_id)
+    {
+        return false;
+    }
+    PersistNowSegment();
+    return true;
+}
+
 // return the offset from the start of datapool
 template <typename T>
 uint64_t LogWriter::append_log(T *data)

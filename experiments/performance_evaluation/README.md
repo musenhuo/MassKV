@@ -7,11 +7,15 @@
 - key size = `16B`
 - value size = `16B`
 - KV block size = `4KB`
-- subtree leaf page size = `4KB`
-- subtree internal node size = `16KB`
+- subtree B+Tree leaf page size = `16KB`
+- subtree B+Tree internal page size = `16KB`
 - key 语义固定为：
   - 前 `8B` = `prefix`
   - 后 `8B` = `suffix`
+- L1 索引口径固定为 SSD 驻留主路径：
+  - Layer0（Masstree）内存驻留
+  - Layer1（B+Tree pages）SSD 驻留
+  - 点查/范围查仅走页级 I/O 路径
 
 ## 当前冻结的数据规模
 
@@ -96,7 +100,7 @@
 
 - `01_point_lookup/`：点查询吞吐与延迟
 - `02_range_query/`：范围查询与并行扫描
-- `03_compaction_update/`：compaction、CoW 与更新代价
+- `03_compaction_update/`：在线写性能（compaction-focused）
 - `04_space_overhead/`：空间与内存开销
 - `05_recovery_runtime/`：恢复时间与恢复后运行代价
 - `06_long_running_mixed/`：长时间混合负载
@@ -108,6 +112,7 @@
 - 数据生成统一要求：
   - 默认使用 `experiments/common/fast_bulk_l1_builder.h` 提供的 `BuildFastBulkL1Dataset` 接口
   - 采用自底向上批量建库（benchmark-only），避免在线写入/compaction 路径带来的建数耗时噪声
+  - 例外：`03_compaction_update` 固定使用 `build_mode=online`，因为实验目标就是测在线写入与 compaction
 
 ## 结果文档统一规范（强制）
 
@@ -121,4 +126,10 @@
 - 结论必须给出定量对比，不接受仅描述性结论。
 - 内存开销指标为强制项：
   - `Raw Result Table` 必须包含 `RSS (bytes)` 与 `L1 Index Memory (bytes)`。
+  - `L1 Index Memory (bytes)` 需要同时保留两套口径：
+    - 估算：`l1_route_index_estimated_bytes`
+    - 实测：`l1_route_index_measured_bytes`
+  - 对外主结论默认使用实测值，估算值作为对照。
   - 必须提供 `Memory Overhead Table`（至少拆分 route/subtree/cache/governance 五类开销）。
+  - `l1_governance_bytes` 若为 `0` 也必须保留该列；当前口径下该项不再重复计费。
+  - `l1_route_partition_bytes`、`l1_subtree_bytes`、`l1_subtree_cache_bytes` 必须单列展示，但不并入 `L1 Index Memory (bytes)`。

@@ -192,6 +192,8 @@ int scanstackelt<P>::find_initial(H& helper, key_type& ka, bool emit_equal,
  retry_node:
     // if (v_.deleted())
     //     goto retry_root;
+    if (unlikely(v_.cold()))
+        return scan_up;  // cold stub: no entries to emit, signal end
     n_->prefetch();
     perm_ = n_->permutation();
 
@@ -243,6 +245,8 @@ int scanstackelt<P>::find_retry(H& helper, key_type& ka, threadinfo& ti)
     // if (v_.deleted())
     //     goto retry;
 
+    if (unlikely(v_.cold()))
+        return scan_up;  // cold stub: skip
     n_->prefetch();
     perm_ = n_->permutation();
     ki_ = helper.lower(ka, this);
@@ -293,6 +297,13 @@ int scanstackelt<P>::find_next(H &helper, key_type &ka, leafvalue_type &entry)
     if (!n_) {
         helper.mark_key_complete();
         return scan_up;
+    }
+    {
+        auto adv_v = n_->stable(relax_fence_function());
+        if (unlikely(adv_v.cold())) {
+            helper.mark_key_complete();
+            return scan_up;
+        }
     }
     n_->prefetch();
 

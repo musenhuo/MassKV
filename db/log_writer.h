@@ -20,6 +20,7 @@ public:
     size_t ReadBufferedValue(const Slice &key, ValuePtr ptr, char* output_buffer);
     void SwitchToNewSegment(int log_segment_group_id);
     void PersistNowSegment();
+    bool PersistNowSegmentIfGroup(int log_segment_group_id);
 
 private:
     template <typename T>

@@ -3,11 +3,7 @@
 #include "lib/hybrid_l1/l1_hybrid_index.h"
 #include "lib/hybrid_l1/prefix_suffix.h"
 #include "lib/hybrid_l1/subtree_record.h"
-#if defined(USE_HMASSTREE)
-#include "lib/index_hmasstree.h"
-#else
 #include "lib/index_masstree.h"
-#endif
 #ifdef HOT_L1
 #include "lib/index_hot.h"
 #endif
@@ -23,7 +19,8 @@
 namespace {
 
 constexpr uint32_t kL1HybridStateMagic = 0x4C314853u;   // "L1HS"
-constexpr uint16_t kL1HybridStateFormat = 2;
+constexpr uint16_t kL1HybridStateFormat = 5;
+constexpr uint32_t kL1SubtreePageSizeBytes = 16 * 1024;
 
 void WriteU16(std::vector<uint8_t>& out, uint16_t value) {
     out.push_back(static_cast<uint8_t>(value & 0xFFu));
@@ -159,21 +156,35 @@ bool ParseEnvSize(const char* name, size_t& out) {
     return true;
 }
 
+uint64_t KvBlockPtrFromTable(const PSTMeta& table) {
+    return flowkv::hybrid_l1::SubtreeRecord::EncodeKvBlockPtr(table.datablock_ptr_);
+}
+
 }  // namespace
 
-Version::Version(SegmentAllocator *seg_allocator) : pst_reader_(seg_allocator)
+Version::Version(SegmentAllocator *seg_allocator)
+    : pst_reader_(seg_allocator)
 {
     level0_table_lists_.resize(MAX_L0_TREE_NUM);
     for (int i = 0; i < MAX_L0_TREE_NUM; i++)
     {
         level0_trees_[i] = nullptr;
     }
-    level1_tables_.reserve(6553600); // reserve for at most 6400M records
+    size_t l1_block_map_reserve = 0;
+    if (ParseEnvSize("FLOWKV_L1_TABLE_META_RESERVE", l1_block_map_reserve) &&
+        l1_block_map_reserve > 0) {
+        level1_table_by_block_.reserve(l1_block_map_reserve);
+    }
     flowkv::hybrid_l1::L1HybridIndex::BuildOptions options;
+    options.subtree_page_size = kL1SubtreePageSizeBytes;
     options.segment_allocator = seg_allocator;
     bool enable_subtree_cache = false;
     if (ParseEnvBool("FLOWKV_L1_ENABLE_SUBTREE_CACHE", enable_subtree_cache)) {
         options.enable_subtree_cache = enable_subtree_cache;
+    }
+    bool enable_leaf_stream_bulk_load = false;
+    if (ParseEnvBool("FLOWKV_L1_ENABLE_LEAF_STREAM_BULKLOAD", enable_leaf_stream_bulk_load)) {
+        options.update_policy.enable_leaf_stream_bulk_load = enable_leaf_stream_bulk_load;
     }
     size_t subtree_cache_capacity = 0;
     if (ParseEnvSize("FLOWKV_L1_SUBTREE_CACHE_CAPACITY", subtree_cache_capacity)) {
@@ -182,6 +193,13 @@ Version::Version(SegmentAllocator *seg_allocator) : pst_reader_(seg_allocator)
     size_t subtree_cache_max_bytes = 0;
     if (ParseEnvSize("FLOWKV_L1_SUBTREE_CACHE_MAX_BYTES", subtree_cache_max_bytes)) {
         options.subtree_cache_max_bytes = subtree_cache_max_bytes;
+    }
+    size_t route_hot_leaf_budget_bytes = 0;
+    if (ParseEnvSize("FLOWKV_L1_ROUTE_HOT_LEAF_BUDGET_BYTES", route_hot_leaf_budget_bytes)) {
+        options.route_hot_leaf_budget_bytes = route_hot_leaf_budget_bytes;
+    } else if (ParseEnvSize("FLOWKV_L1_ROUTE_HOT_INDEX_MAX_BYTES", route_hot_leaf_budget_bytes)) {
+        // Backward-compatible fallback for older experiment scripts.
+        options.route_hot_leaf_budget_bytes = route_hot_leaf_budget_bytes;
     }
     if (!options.enable_subtree_cache) {
         options.subtree_cache_capacity = 0;
@@ -220,6 +238,9 @@ std::vector<PSTMeta>::const_iterator FindTableInLevels(const std::vector<PSTMeta
 }
 int Version::InsertTableToL0(TaggedPstMeta tmeta, int tree_idx)
 {
+    if (tree_idx < 0 || tree_idx >= MAX_L0_TREE_NUM) {
+        return -1;
+    }
     // get position
     PSTMeta table = tmeta.meta;
     int idx = level0_table_lists_[tree_idx].size();
@@ -227,6 +248,9 @@ int Version::InsertTableToL0(TaggedPstMeta tmeta, int tree_idx)
     // update index
     ValueHelper lh((uint64_t)idx);
     KeyType tempk = table.MaxKey();
+    if (level0_trees_[tree_idx] == nullptr) {
+        return -1;
+    }
     level0_trees_[tree_idx]->Put(tempk, lh);
     KeyType maxk = tmeta.meta.MaxKey();
     KeyType mink = tmeta.meta.MinKey();
@@ -242,60 +266,152 @@ int Version::InsertTableToL0(TaggedPstMeta tmeta, int tree_idx)
 }
 int Version::InsertTableToL1(TaggedPstMeta tmeta)
 {
-    int idx;
-    // find a position
-    if (level1_free_list_.empty())
-    {
-        idx = level1_tables_.size();
-        level1_tables_.emplace_back(tmeta);
+    if (tmeta.Valid()) {
+        level1_table_by_block_[KvBlockPtrFromTable(tmeta.meta)] = tmeta;
     }
-    else
-    {
-        idx = level1_free_list_.back();
-        level1_free_list_.pop_back();
-        level1_tables_[idx] = tmeta;
-    }
-
-    assert(level1_tables_.size() > idx);
-    RebuildLevel1Partitions(CollectChangedRouteKeysForTable(tmeta.meta));
-    return idx;
+    QueueOrApplyL1Rebuild(CollectChangedRouteKeysForTable(tmeta.meta));
+    return -1;
 }
 
-void Version::RecoverLevel1Tables(std::vector<TaggedPstMeta> tables, uint32_t next_l1_seq)
+void Version::BeginRecoverLevel1(uint32_t next_l1_seq, size_t expected_table_count)
 {
-    level1_tables_ = std::move(tables);
-    level1_free_list_.clear();
-    for (size_t i = 0; i < level1_tables_.size(); ++i) {
-        if (!level1_tables_[i].Valid()) {
-            level1_free_list_.push_back(i);
+    l1_batch_update_depth_ = 0;
+    pending_l1_changed_route_keys_.clear();
+    has_pending_l1_delta_batch_ = false;
+    pending_l1_delta_batch_ = flowkv::hybrid_l1::L1DeltaBatch{};
+
+    level1_table_by_block_.clear();
+    if (expected_table_count > 0) {
+        level1_table_by_block_.reserve(expected_table_count);
+    }
+
+    l1_seq_ = static_cast<int>(next_l1_seq);
+}
+
+void Version::RecoverLevel1Table(const TaggedPstMeta& table)
+{
+    if (!table.Valid()) {
+        return;
+    }
+    level1_table_by_block_[KvBlockPtrFromTable(table.meta)] = table;
+}
+
+void Version::FinalizeRecoverLevel1()
+{
+    RebuildLevel1Tree();
+}
+
+void Version::RecoverLevel1Tables(const std::vector<TaggedPstMeta>& tables, uint32_t next_l1_seq)
+{
+    size_t valid_count = 0;
+    for (const auto& table : tables) {
+        if (table.Valid()) {
+            ++valid_count;
         }
     }
-    l1_seq_ = static_cast<int>(next_l1_seq);
-    RebuildLevel1Tree();
+    BeginRecoverLevel1(next_l1_seq, valid_count);
+    for (const auto& table : tables) {
+        RecoverLevel1Table(table);
+    }
+    FinalizeRecoverLevel1();
 }
 
 // 删除时比对删除的value是否为table的indexblock_ptr，若不是说明已经被同key的其他pst替代了
 bool Version::DeleteTableInL1(PSTMeta table)
 {
-    for (size_t idx = 0; idx < level1_tables_.size(); ++idx) {
-        auto &entry = level1_tables_[idx];
-        if (!entry.Valid()) {
-            continue;
-        }
-        PSTMeta &old = entry.meta;
-        if (old.datablock_ptr_ != table.datablock_ptr_) {
-            continue;
-        }
-        if (CompareKeyType(old.MaxKey(), table.MaxKey()) != 0 ||
-            CompareKeyType(old.MinKey(), table.MinKey()) != 0) {
-            continue;
-        }
-        entry.meta = PSTMeta::InvalidTable();
-        level1_free_list_.push_back(idx);
-        RebuildLevel1Partitions(CollectChangedRouteKeysForTable(table));
-        return true;
+    const uint64_t kv_block_ptr = KvBlockPtrFromTable(table);
+    auto map_it = level1_table_by_block_.find(kv_block_ptr);
+    if (map_it == level1_table_by_block_.end()) {
+        return false;
     }
-    return false;
+    const TaggedPstMeta stored = map_it->second;
+    const PSTMeta& old = stored.meta;
+    if (old.datablock_ptr_ != table.datablock_ptr_ ||
+        CompareKeyType(old.MaxKey(), table.MaxKey()) != 0 ||
+        CompareKeyType(old.MinKey(), table.MinKey()) != 0) {
+        return false;
+    }
+    level1_table_by_block_.erase(map_it);
+
+    QueueOrApplyL1Rebuild(CollectChangedRouteKeysForTable(table));
+    return true;
+}
+
+void Version::BeginL1BatchUpdate()
+{
+    if (l1_batch_update_depth_ == 0) {
+        pending_l1_changed_route_keys_.clear();
+    }
+    ++l1_batch_update_depth_;
+}
+
+void Version::EndL1BatchUpdate()
+{
+    if (l1_batch_update_depth_ <= 0) {
+        return;
+    }
+    --l1_batch_update_depth_;
+    if (l1_batch_update_depth_ != 0) {
+        return;
+    }
+    std::vector<KeyType> changed_route_keys;
+    const flowkv::hybrid_l1::L1DeltaBatch* delta_batch_ptr = nullptr;
+    if (has_pending_l1_delta_batch_) {
+        changed_route_keys = pending_l1_delta_batch_.ToChangedRouteKeys();
+        delta_batch_ptr = &pending_l1_delta_batch_;
+        has_pending_l1_delta_batch_ = false;
+    } else {
+        changed_route_keys.swap(pending_l1_changed_route_keys_);
+    }
+    if (changed_route_keys.empty()) {
+        if (delta_batch_ptr != nullptr) {
+            pending_l1_delta_batch_ = flowkv::hybrid_l1::L1DeltaBatch{};
+        }
+        return;
+    }
+    RebuildLevel1Partitions(changed_route_keys, delta_batch_ptr);
+    if (!level1_table_by_block_.empty() && level1_tree_->Empty()) {
+        // Safety net: if delta-only rebuild doesn't materialize descriptors,
+        // fall back to table-driven rebuild to preserve read correctness.
+        RebuildLevel1Tree();
+    }
+    if (delta_batch_ptr != nullptr) {
+        pending_l1_delta_batch_ = flowkv::hybrid_l1::L1DeltaBatch{};
+    }
+}
+
+void Version::SetPendingL1DeltaBatch(flowkv::hybrid_l1::L1DeltaBatch batch)
+{
+    batch.SortAndUniquePrefixes();
+    has_pending_l1_delta_batch_ = !batch.Empty();
+    pending_l1_delta_batch_ = std::move(batch);
+}
+
+bool Version::ResolveL1BlockToTableMeta(uint64_t kv_block_ptr, TaggedPstMeta& output) const
+{
+    const auto it = level1_table_by_block_.find(kv_block_ptr);
+    if (it == level1_table_by_block_.end()) {
+        return false;
+    }
+    if (!it->second.Valid()) {
+        return false;
+    }
+    if (KvBlockPtrFromTable(it->second.meta) != kv_block_ptr) {
+        return false;
+    }
+    output = it->second;
+    return true;
+}
+
+bool Version::ResolveL1RecordToTableMeta(
+    const flowkv::hybrid_l1::SubtreeRecord& record,
+    TaggedPstMeta& output) const
+{
+    const auto window = record.LeafWindow();
+    if (window.count == 0) {
+        return false;
+    }
+    return ResolveL1BlockToTableMeta(window.kv_block_ptr, output);
 }
 
 // bool Version::DeleteTable(int idx, int level_id)
@@ -327,7 +443,102 @@ bool IsDeletedValueBytes(const char* value_bytes) {
     return IsDeletedFixedValue16Bytes(value_bytes);
 }
 
+bool TaggedTableByMaxKeyLess(const TaggedPstMeta& lhs, const TaggedPstMeta& rhs) {
+    const int max_cmp = CompareKeyType(lhs.meta.MaxKey(), rhs.meta.MaxKey());
+    if (max_cmp != 0) {
+        return max_cmp < 0;
+    }
+    const int min_cmp = CompareKeyType(lhs.meta.MinKey(), rhs.meta.MinKey());
+    if (min_cmp != 0) {
+        return min_cmp < 0;
+    }
+    return lhs.meta.datablock_ptr_ < rhs.meta.datablock_ptr_;
+}
+
+void SortResolvedTablesByKeyRange(std::vector<TaggedPstMeta>& tables) {
+    std::sort(tables.begin(), tables.end(), TaggedTableByMaxKeyLess);
+}
+
 }  // namespace
+
+void Version::CollectActiveLevel1Tables(std::vector<TaggedPstMeta>& output) const
+{
+    output.clear();
+    output.reserve(level1_table_by_block_.size());
+    for (const auto& [_, table] : level1_table_by_block_) {
+        if (!table.Valid()) {
+            continue;
+        }
+        output.push_back(table);
+    }
+    SortResolvedTablesByKeyRange(output);
+}
+
+void Version::RebuildLevel1TableMapFromRecords()
+{
+    level1_table_by_block_.clear();
+    if (level1_tree_ == nullptr || level1_tree_->Empty()) {
+        return;
+    }
+
+    std::vector<flowkv::hybrid_l1::SubtreeRecord> records;
+    level1_tree_->ExportAll(records);
+    level1_table_by_block_.reserve(records.size());
+
+    for (const auto& record : records) {
+        const auto window = record.LeafWindow();
+        if (window.count == 0) {
+            continue;
+        }
+        const uint64_t kv_block_ptr = window.kv_block_ptr;
+        const uint64_t block_off =
+            flowkv::hybrid_l1::SubtreeRecord::DecodeKvBlockOffset(kv_block_ptr);
+        auto [it, inserted] = level1_table_by_block_.emplace(kv_block_ptr, TaggedPstMeta{});
+        TaggedPstMeta& table = it->second;
+        if (inserted) {
+            table.level = 1;
+            table.manifest_position = std::numeric_limits<size_t>::max();
+            table.meta = PSTMeta::InvalidTable();
+            table.meta.datablock_ptr_ = block_off;
+            table.meta.seq_no_ = record.seq_no;
+            table.meta.entry_num_ = window.count;
+#if defined(FLOWKV_KEY16)
+            table.meta.min_key_hi = record.min_key.hi;
+            table.meta.min_key_lo = record.min_key.lo;
+            table.meta.max_key_hi = record.max_key.hi;
+            table.meta.max_key_lo = record.max_key.lo;
+#else
+            table.meta.min_key_ = record.min_key;
+            table.meta.max_key_ = record.max_key;
+#endif
+            continue;
+        }
+
+        if (record.seq_no > table.meta.seq_no_) {
+            table.meta.seq_no_ = record.seq_no;
+        }
+        if (CompareKeyType(record.min_key, table.meta.MinKey()) < 0) {
+#if defined(FLOWKV_KEY16)
+            table.meta.min_key_hi = record.min_key.hi;
+            table.meta.min_key_lo = record.min_key.lo;
+#else
+            table.meta.min_key_ = record.min_key;
+#endif
+        }
+        if (CompareKeyType(record.max_key, table.meta.MaxKey()) > 0) {
+#if defined(FLOWKV_KEY16)
+            table.meta.max_key_hi = record.max_key.hi;
+            table.meta.max_key_lo = record.max_key.lo;
+#else
+            table.meta.max_key_ = record.max_key;
+#endif
+        }
+        const uint32_t merged_entry_num =
+            static_cast<uint32_t>(table.meta.entry_num_) + static_cast<uint32_t>(window.count);
+        table.meta.entry_num_ = static_cast<uint16_t>(
+            std::min<uint32_t>(merged_entry_num, std::numeric_limits<uint16_t>::max()));
+    }
+}
 
 void PrintL1DebugStats() {
     printf("=== L1 Lookup Stats ===\n");
@@ -341,16 +552,7 @@ void PrintL1DebugStats() {
 
 void Version::PrintL1IndexStats() {
     printf("=== L1 Index Stats ===\n");
-    printf("  Total PST entries in vector: %lu\n", level1_tables_.size());
-    printf("  Free list size: %lu\n", level1_free_list_.size());
-    printf("  Active PST count: %lu\n", level1_tables_.size() - level1_free_list_.size());
-    
-    // Count valid entries
-    int valid_count = 0;
-    for (const auto& pst : level1_tables_) {
-        if (pst.Valid()) valid_count++;
-    }
-    printf("  Valid PST count: %d\n", valid_count);
+    printf("  Active PST count(block map): %lu\n", level1_table_by_block_.size());
     printf("======================\n");
 }
 
@@ -456,61 +658,36 @@ bool Version::Get(Slice key, const char *value_out, int *value_size, PSTReader *
         DEBUG("5");
         return false;
     }
-    int idx = static_cast<int>(l1_record.table_idx);
-    if (idx < 0 || static_cast<size_t>(idx) >= level1_tables_.size()) {
-        g_l1_idx_not_found_.fetch_add(1, std::memory_order_relaxed);
-        DEBUG("L1 idx out of range: idx=%d, table_size=%lu", idx, level1_tables_.size());
-        return false;
-    }
-    table = level1_tables_[idx];
-    if (!table.Valid())
-    {
-        g_l1_table_invalid_.fetch_add(1, std::memory_order_relaxed);
+    if (!l1_record.Contains(int_key) || !l1_record.HasLeafWindow()) {
+        g_l1_range_check_fail_.fetch_add(1, std::memory_order_relaxed);
         DEBUG("6");
         return false;
     }
-
-#if defined(FLOWKV_KEY16)
-    if (!(table.meta.MinKey().hi == MAX_UINT64 && table.meta.MinKey().lo == MAX_UINT64) && KeyTypeGreater(table.meta.MinKey(), int_key))
-#else
-    if (table.meta.MinKey() != MAX_UINT64 && KeyTypeGreater(table.meta.MinKey(), int_key))
-#endif
-    {
-        g_l1_range_check_fail_.fetch_add(1, std::memory_order_relaxed);
-#if defined(FLOWKV_KEY16)
-        KeyType tmin = table.meta.MinKey();
-        KeyType tmax = table.meta.MaxKey();
-        DEBUG("7, key=%lu:%lu at %lu (%lu:%lu~%lu:%lu)", int_key.hi, int_key.lo, table.meta.datablock_ptr_, tmin.hi, tmin.lo, tmax.hi, tmax.lo);
-#else
-        DEBUG("7, key=%lu at %lu (%lu~%lu)", key.ToUint64Bswap(), table.meta.datablock_ptr_, __bswap_64(table.meta.MinKey()), __bswap_64(table.meta.MaxKey()));
-#endif
+    const auto window = l1_record.LeafWindow();
+    const uint64_t block_off =
+        flowkv::hybrid_l1::SubtreeRecord::DecodeKvBlockOffset(window.kv_block_ptr);
+    if (window.count == 0 ||
+        window.offset >= static_cast<uint16_t>(PDataBlock::MAX_ENTRIES)) {
+        g_l1_table_invalid_.fetch_add(1, std::memory_order_relaxed);
+        DEBUG("7");
         return false;
     }
-    bool ret = false;
-    if (l1_record.HasLeafWindow()) {
-        const auto window = l1_record.LeafWindow();
-        const uint64_t hinted_block_off =
-            flowkv::hybrid_l1::SubtreeRecord::DecodeKvBlockOffset(window.kv_block_ptr);
-        if (window.count > 0 && hinted_block_off == table.meta.datablock_ptr_ &&
-            window.offset < table.meta.entry_num_) {
-            const uint16_t remaining = static_cast<uint16_t>(table.meta.entry_num_ - window.offset);
-            const uint16_t hinted_entries = std::min<uint16_t>(remaining, window.count);
-            if (hinted_entries > 0) {
-                ret = pst_reader->PointQueryWindow(
-                    table.meta.datablock_ptr_,
-                    key,
-                    value_out,
-                    value_size,
-                    table.meta.entry_num_,
-                    window.offset,
-                    hinted_entries);
-            }
-        }
+    const uint16_t bounded_entries = static_cast<uint16_t>(std::min<uint32_t>(
+        static_cast<uint32_t>(window.count),
+        static_cast<uint32_t>(PDataBlock::MAX_ENTRIES) -
+            static_cast<uint32_t>(window.offset)));
+    if (bounded_entries == 0) {
+        g_l1_table_invalid_.fetch_add(1, std::memory_order_relaxed);
+        DEBUG("8");
+        return false;
     }
-    if (!ret) {
-        ret = pst_reader->PointQuery(
-            table.meta.datablock_ptr_, key, value_out, value_size, table.meta.entry_num_);
-    }
+    const bool ret = pst_reader->PointQueryWindow(
+        block_off,
+        key,
+        value_out,
+        value_size,
+        window.offset,
+        bounded_entries);
 
     if (ret && IsDeletedValueBytes(value_out)) {
         return false;
@@ -527,43 +704,46 @@ bool Version::Get(Slice key, const char *value_out, int *value_size, PSTReader *
 
 RowIterator *Version::GetLevel1Iter(Slice key, PSTReader *pst_reader, std::vector<TaggedPstMeta> &table_metas)
 {
-    std::vector<flowkv::hybrid_l1::SubtreeRecord> matches;
 #if defined(FLOWKV_KEY16)
     KeyType int_key = key.ToKey16();
 #else
     KeyType int_key = key.ToUint64();
 #endif
-    level1_tree_->LookupCandidates(int_key, 2, matches);
-    for (const auto &record : matches)
-    {
-        if (record.table_idx < level1_tables_.size()) {
-            table_metas.push_back(level1_tables_[record.table_idx]);
-        }
-    }
+    flowkv::hybrid_l1::RangeScanRecordOptions options;
+    options.include_window_fragments = true;
+    options.include_unique_blocks = true;
+    options.dedup_windows = true;
+    flowkv::hybrid_l1::RangeScanRecordResult result;
+    level1_tree_->RangeScanRecords(int_key, int_key, options, result);
+    ResolveL1BlocksToTables(result.unique_kv_block_ptrs, table_metas);
     return new RowIterator(pst_reader, table_metas);
 }
 
 bool Version::CheckSpaceForL0Tree()
 {
+    std::lock_guard<std::mutex> lock(l0_meta_lock_);
     return (l0_tail_ + 1) % MAX_L0_TREE_NUM != l0_head_;
 }
 
-int Version::AddLevel0Tree()
+int Version::AddLevel0Tree(uint32_t *seq_no_out)
 {
+    std::lock_guard<std::mutex> lock(l0_meta_lock_);
     if ((l0_tail_ + 1) % MAX_L0_TREE_NUM == l0_head_)
         return -1;
     auto ret = l0_tail_;
     l0_tail_ = (l0_tail_ + 1) % MAX_L0_TREE_NUM;
 #ifdef MASSTREE_L1
-    #if defined(USE_HMASSTREE)
-    level0_trees_[ret] = new HMasstreeIndex();
-    #else
     level0_trees_[ret] = new MasstreeIndex();
-    #endif
 #endif
 #ifdef HOT_L1
     level0_trees_[ret] = new HOTIndex(MAX_PST_L1);
 #endif
+    level0_table_lists_[ret].clear();
+    level0_tree_meta_[ret] = TreeMeta();
+    l0_tree_ready_[ret] = false;
+    if (seq_no_out != nullptr) {
+        *seq_no_out = static_cast<uint32_t>(l0_tree_seq_);
+    }
     l0_tree_seq_++;
     return ret;
 }
@@ -586,32 +766,56 @@ uint32_t Version::GenerateL1Seq()
 
 bool Version::FreeLevel0Tree()
 {
-
-    if (l0_tail_ == l0_head_)
+    Index *to_free = nullptr;
     {
-        return false;
+        std::lock_guard<std::mutex> lock(l0_meta_lock_);
+        if (l0_tail_ == l0_head_)
+        {
+            return false;
+        }
+        auto idx = l0_head_;
+        l0_head_ = (l0_head_ + 1) % MAX_L0_TREE_NUM;
+        to_free = level0_trees_[idx];
+        level0_trees_[idx] = nullptr;
+        level0_tree_meta_[idx] = TreeMeta();
+        level0_table_lists_[idx].clear();
+        l0_tree_ready_[idx] = false;
     }
-    auto idx = l0_head_;
-    l0_head_ = (l0_head_ + 1) % MAX_L0_TREE_NUM;
-    // printf("before FreeLevel0Tree\n");
     // wait for reader leave the index (just sleep for > 1ms)
     usleep(100);
-    delete level0_trees_[idx];
-    // printf("after FreeLevel0Tree\n");
-    level0_trees_[idx] = nullptr;
-    level0_tree_meta_[idx] = TreeMeta();
-    level0_table_lists_[idx].clear();
+    delete to_free;
     return true;
 }
+void Version::PublishLevel0Tree(int tree_idx)
+{
+    std::lock_guard<std::mutex> lock(l0_meta_lock_);
+    if (tree_idx < 0 || tree_idx >= MAX_L0_TREE_NUM) {
+        return;
+    }
+    l0_tree_ready_[tree_idx] = true;
+    while (l0_read_tail_ != l0_tail_ && l0_tree_ready_[l0_read_tail_]) {
+        l0_read_tail_ = (l0_read_tail_ + 1) % MAX_L0_TREE_NUM;
+    }
+}
+
 void Version::UpdateLevel0ReadTail()
 {
+    std::lock_guard<std::mutex> lock(l0_meta_lock_);
     l0_read_tail_ = l0_tail_;
+    for (int idx = l0_head_; idx != l0_read_tail_; idx = (idx + 1) % MAX_L0_TREE_NUM) {
+        l0_tree_ready_[idx] = true;
+    }
 }
 
 int Version::PickLevel0Trees(std::vector<std::vector<TaggedPstMeta>> &outputs, std::vector<TreeMeta> &tree_metas, int max_size)
 {
-    int tail = l0_read_tail_;
-    int head = l0_head_;
+    int tail = 0;
+    int head = 0;
+    {
+        std::lock_guard<std::mutex> lock(l0_meta_lock_);
+        tail = l0_read_tail_;
+        head = l0_head_;
+    }
     DEBUG("pick level0 tree from %d to %d", head, tail);
     int tree_num = (tail + MAX_L0_TREE_NUM - head) % MAX_L0_TREE_NUM;
     outputs.resize(tree_num);
@@ -656,16 +860,77 @@ int Version::PickLevel0Trees(std::vector<std::vector<TaggedPstMeta>> &outputs, s
 }
 bool Version::PickOverlappedL1Tables(const KeyType &min, const KeyType &max, std::vector<TaggedPstMeta> &output)
 {
-    std::vector<flowkv::hybrid_l1::SubtreeRecord> matches;
-    level1_tree_->RangeScan(min, max, matches);
-    for (const auto &record : matches)
-    {
-        if (record.table_idx >= level1_tables_.size()) {
+    std::vector<flowkv::hybrid_l1::SubtreeRecord> records;
+    std::vector<uint64_t> unique_kv_block_ptrs;
+    if (!PickOverlappedL1Records(min, max, records, unique_kv_block_ptrs)) {
+        output.clear();
+        return false;
+    }
+    ResolveL1BlocksToTables(unique_kv_block_ptrs, output);
+    return true;
+}
+
+bool Version::PickOverlappedL1Records(
+    const KeyType &min,
+    const KeyType &max,
+    std::vector<flowkv::hybrid_l1::SubtreeRecord> &records,
+    std::vector<uint64_t> &unique_kv_block_ptrs) const
+{
+    records.clear();
+    unique_kv_block_ptrs.clear();
+    if (level1_tree_ == nullptr) {
+        return false;
+    }
+    flowkv::hybrid_l1::RangeScanRecordOptions options;
+    options.include_window_fragments = true;
+    options.include_unique_blocks = true;
+    options.dedup_windows = true;
+    flowkv::hybrid_l1::RangeScanRecordResult result;
+    level1_tree_->RangeScanRecords(min, max, options, result);
+    records = std::move(result.window_fragments);
+    unique_kv_block_ptrs = std::move(result.unique_kv_block_ptrs);
+    return true;
+}
+
+void Version::ResolveL1RecordsToTables(
+    const std::vector<flowkv::hybrid_l1::SubtreeRecord> &records,
+    std::vector<TaggedPstMeta> &output) const
+{
+    std::vector<uint64_t> kv_block_ptrs;
+    kv_block_ptrs.reserve(records.size());
+    std::unordered_set<uint64_t> seen_blocks;
+    seen_blocks.reserve(records.size());
+    for (const auto& record : records) {
+        const auto window = record.LeafWindow();
+        if (window.count == 0) {
             continue;
         }
-        output.emplace_back(level1_tables_[record.table_idx]);
+        if (!seen_blocks.insert(window.kv_block_ptr).second) {
+            continue;
+        }
+        kv_block_ptrs.push_back(window.kv_block_ptr);
     }
-    return true;
+    ResolveL1BlocksToTables(kv_block_ptrs, output);
+}
+
+void Version::ResolveL1BlocksToTables(const std::vector<uint64_t>& kv_block_ptrs,
+                                      std::vector<TaggedPstMeta>& output) const
+{
+    output.clear();
+    output.reserve(kv_block_ptrs.size());
+    std::unordered_set<uint64_t> seen_blocks;
+    seen_blocks.reserve(kv_block_ptrs.size());
+    for (const auto kv_block_ptr : kv_block_ptrs) {
+        if (!seen_blocks.insert(kv_block_ptr).second) {
+            continue;
+        }
+        TaggedPstMeta resolved;
+        if (!ResolveL1BlockToTableMeta(kv_block_ptr, resolved)) {
+            continue;
+        }
+        output.push_back(resolved);
+    }
+    SortResolvedTablesByKeyRange(output);
 }
 
 bool Version::L1TreeConsistencyCheckAndFix(PSTDeleter *pst_deleter,Manifest* manifest)
@@ -675,20 +940,18 @@ bool Version::L1TreeConsistencyCheckAndFix(PSTDeleter *pst_deleter,Manifest* man
     TaggedPstMeta last_pst_meta, current_pst_meta;
     flowkv::hybrid_l1::SubtreeRecord last_fragment;
     bool has_last_fragment = false;
-    std::unordered_set<uint64_t> deleted_table_idx;
+    std::unordered_set<uint64_t> deleted_blocks;
     DEBUG("L1 local fragment size=%lu",fragments.size());
     for (const auto &fragment : fragments)
     {
-        if (fragment.table_idx >= level1_tables_.size()) {
+        TaggedPstMeta resolved;
+        if (!ResolveL1RecordToTableMeta(fragment, resolved)) {
             continue;
         }
-        if (deleted_table_idx.find(fragment.table_idx) != deleted_table_idx.end()) {
+        if (deleted_blocks.find(resolved.meta.datablock_ptr_) != deleted_blocks.end()) {
             continue;
         }
-        current_pst_meta = level1_tables_[fragment.table_idx];
-        if (!current_pst_meta.Valid()) {
-            continue;
-        }
+        current_pst_meta = resolved;
 
         bool current_deleted = false;
         if (has_last_fragment &&
@@ -698,15 +961,21 @@ bool Version::L1TreeConsistencyCheckAndFix(PSTDeleter *pst_deleter,Manifest* man
             if (last_pst_meta.meta.seq_no_ < current_pst_meta.meta.seq_no_)
             {
                 DeleteTableInL1(last_pst_meta.meta);
-                manifest->DeleteTable(last_pst_meta.manifest_position,1);
-                deleted_table_idx.insert(last_fragment.table_idx);
+                if (manifest != nullptr &&
+                    last_pst_meta.manifest_position != std::numeric_limits<size_t>::max()) {
+                    manifest->DeleteTable(static_cast<int>(last_pst_meta.manifest_position), 1);
+                }
+                deleted_blocks.insert(last_pst_meta.meta.datablock_ptr_);
                 has_last_fragment = false;
             }
             else
             {
                 DeleteTableInL1(current_pst_meta.meta);
-                manifest->DeleteTable(current_pst_meta.manifest_position,1);
-                deleted_table_idx.insert(fragment.table_idx);
+                if (manifest != nullptr &&
+                    current_pst_meta.manifest_position != std::numeric_limits<size_t>::max()) {
+                    manifest->DeleteTable(static_cast<int>(current_pst_meta.manifest_position), 1);
+                }
+                deleted_blocks.insert(current_pst_meta.meta.datablock_ptr_);
                 current_deleted = true;
             }
         }
@@ -748,37 +1017,24 @@ void Version::DebugExportLevel1LocalFragments(
 bool Version::DebugResolveLevel1Record(const flowkv::hybrid_l1::SubtreeRecord &record,
                                        TaggedPstMeta &output) const
 {
-    if (record.table_idx >= level1_tables_.size()) {
-        return false;
-    }
-    if (!level1_tables_[record.table_idx].Valid()) {
-        return false;
-    }
-    output = level1_tables_[record.table_idx];
-    return true;
+    return ResolveL1RecordToTableMeta(record, output);
 }
 
 void Version::DebugExportActiveLevel1Tables(std::vector<TaggedPstMeta> &output) const
 {
-    output.clear();
-    output.reserve(level1_tables_.size());
-    for (const auto &table : level1_tables_) {
-        if (table.Valid()) {
-            output.push_back(table);
-        }
-    }
+    CollectActiveLevel1Tables(output);
 }
 
 void Version::DebugCollectLevel1Candidates(const KeyType &key, std::vector<TaggedPstMeta> &output) const
 {
     output.clear();
-    std::vector<flowkv::hybrid_l1::SubtreeRecord> matches;
-    level1_tree_->LookupCandidates(key, 2, matches);
-    for (const auto &record : matches) {
-        if (record.table_idx < level1_tables_.size() && level1_tables_[record.table_idx].Valid()) {
-            output.push_back(level1_tables_[record.table_idx]);
-        }
-    }
+    flowkv::hybrid_l1::RangeScanRecordOptions options;
+    options.include_window_fragments = false;
+    options.include_unique_blocks = true;
+    options.dedup_windows = true;
+    flowkv::hybrid_l1::RangeScanRecordResult result;
+    level1_tree_->RangeScanRecords(key, key, options, result);
+    ResolveL1BlocksToTables(result.unique_kv_block_ptrs, output);
 }
 
 void Version::DebugCollectLevel1Overlaps(const KeyType &min,
@@ -788,10 +1044,17 @@ void Version::DebugCollectLevel1Overlaps(const KeyType &min,
     output.clear();
     std::vector<flowkv::hybrid_l1::SubtreeRecord> matches;
     level1_tree_->RangeScan(min, max, matches);
+    std::unordered_set<uint64_t> seen_blocks;
+    seen_blocks.reserve(matches.size());
     for (const auto &record : matches) {
-        if (record.table_idx < level1_tables_.size() && level1_tables_[record.table_idx].Valid()) {
-            output.push_back(level1_tables_[record.table_idx]);
+        TaggedPstMeta resolved;
+        if (!ResolveL1RecordToTableMeta(record, resolved)) {
+            continue;
         }
+        if (!seen_blocks.insert(resolved.meta.datablock_ptr_).second) {
+            continue;
+        }
+        output.push_back(resolved);
     }
 }
 
@@ -822,16 +1085,19 @@ bool Version::ExportL1HybridState(std::vector<uint8_t>& bytes_out, uint32_t& cur
         WriteU64(bytes_out, partition.generation);
         WriteU64(bytes_out, static_cast<uint64_t>(partition.record_count));
         bytes_out.push_back(EncodeGovernance(partition.governance));
+        bytes_out.push_back(static_cast<uint8_t>(partition.descriptor_mode));
+        bytes_out.push_back(partition.tiny_enter_streak);
+        WriteU64(bytes_out, partition.tiny_leaf_value);
+        WriteU64(bytes_out, partition.pack_page_ptr);
+        bytes_out.push_back(partition.pack_slot_id);
+        bytes_out.push_back(0);
+        WriteU16(bytes_out, 0);
         WriteU32(bytes_out, partition.subtree_store.page_size);
-        WriteU32(bytes_out, static_cast<uint32_t>(partition.subtree_store.pages.size()));
-        bytes_out.push_back(partition.subtree_store.flags);
-        WriteU32(bytes_out, partition.subtree_store.root_page_id);
         WriteU32(bytes_out, partition.subtree_store.page_count);
+        bytes_out.push_back(partition.subtree_store.flags);
+        WriteU64(bytes_out, partition.subtree_store.root_page_ptr);
+        WriteU64(bytes_out, partition.subtree_store.manifest_page_ptr);
         WriteU64(bytes_out, partition.subtree_store.record_count);
-        for (const auto& page_ref : partition.subtree_store.pages) {
-            WriteU64(bytes_out, page_ref.segment_id);
-            WriteU32(bytes_out, page_ref.page_id);
-        }
     }
     return true;
 }
@@ -859,7 +1125,7 @@ bool Version::ImportL1HybridState(const std::vector<uint8_t>& bytes, uint32_t ex
     if (magic != kL1HybridStateMagic || reserved != 0) {
         return false;
     }
-    if (format != 1 && format != kL1HybridStateFormat) {
+    if (format != 3 && format != 4 && format != kL1HybridStateFormat) {
         return false;
     }
     if (snapshot_seq != expected_l1_seq_no) {
@@ -874,11 +1140,17 @@ bool Version::ImportL1HybridState(const std::vector<uint8_t>& bytes, uint32_t ex
         uint64_t partition_generation = 0;
         uint64_t record_count = 0;
         uint8_t governance_flags = 0;
+        uint8_t descriptor_mode = static_cast<uint8_t>(
+            flowkv::hybrid_l1::RouteDescriptorMode::kNormalSubtree);
+        uint8_t tiny_enter_streak = 0;
+        uint64_t tiny_leaf_value = 0;
+        uint64_t pack_page_ptr = flowkv::hybrid_l1::kInvalidSubtreePagePtr;
+        uint8_t pack_slot_id = 0;
         uint32_t page_size = 0;
         uint32_t page_count = 0;
         uint8_t subtree_store_flags = 0;
-        uint32_t subtree_root_page_id = flowkv::hybrid_l1::kInvalidSubtreePageId;
-        uint32_t subtree_page_count = 0;
+        uint64_t subtree_root_page_ptr = flowkv::hybrid_l1::kInvalidSubtreePagePtr;
+        uint64_t subtree_manifest_page_ptr = flowkv::hybrid_l1::kInvalidSubtreePagePtr;
         uint64_t subtree_record_count = 0;
         if (!ReadU64(bytes, cursor, prefix) ||
             !ReadU64(bytes, cursor, partition_generation) ||
@@ -889,46 +1161,72 @@ bool Version::ImportL1HybridState(const std::vector<uint8_t>& bytes, uint32_t ex
             return false;
         }
         governance_flags = bytes[cursor++];
+        if (format >= 4) {
+            if (cursor + 2 > bytes.size()) {
+                return false;
+            }
+            descriptor_mode = bytes[cursor++];
+            tiny_enter_streak = bytes[cursor++];
+            if (!ReadU64(bytes, cursor, tiny_leaf_value)) {
+                return false;
+            }
+            if (format >= 5) {
+                uint16_t descriptor_reserved = 0;
+                if (!ReadU64(bytes, cursor, pack_page_ptr)) {
+                    return false;
+                }
+                if (cursor + 2 > bytes.size()) {
+                    return false;
+                }
+                pack_slot_id = bytes[cursor++];
+                ++cursor;  // reserved byte
+                if (!ReadU16(bytes, cursor, descriptor_reserved)) {
+                    return false;
+                }
+            }
+        }
         if (!ReadU32(bytes, cursor, page_size) || !ReadU32(bytes, cursor, page_count)) {
             return false;
         }
-        if (format >= 2) {
-            if (cursor + 1 > bytes.size()) {
-                return false;
-            }
-            subtree_store_flags = bytes[cursor++];
-            if (!ReadU32(bytes, cursor, subtree_root_page_id) ||
-                !ReadU32(bytes, cursor, subtree_page_count) ||
-                !ReadU64(bytes, cursor, subtree_record_count)) {
-                return false;
-            }
+        if (cursor + 1 > bytes.size()) {
+            return false;
+        }
+        subtree_store_flags = bytes[cursor++];
+        if (!ReadU64(bytes, cursor, subtree_root_page_ptr) ||
+            !ReadU64(bytes, cursor, subtree_manifest_page_ptr) ||
+            !ReadU64(bytes, cursor, subtree_record_count)) {
+            return false;
         }
 
         partition.prefix = prefix;
-        partition.generation = partition_generation;
+        if (partition_generation > std::numeric_limits<uint32_t>::max()) {
+            return false;
+        }
+        partition.generation = static_cast<uint32_t>(partition_generation);
         if (record_count > std::numeric_limits<uint32_t>::max()) {
             return false;
         }
         partition.record_count = static_cast<uint32_t>(record_count);
         partition.governance = DecodeGovernance(governance_flags);
-        partition.subtree_store.page_size = page_size;
-        partition.subtree_store.flags = subtree_store_flags;
-        partition.subtree_store.root_page_id = subtree_root_page_id;
-        partition.subtree_store.page_count = subtree_page_count;
-        partition.subtree_store.record_count = subtree_record_count;
-        partition.subtree_store.pages.reserve(page_count);
-        for (uint32_t p = 0; p < page_count; ++p) {
-            uint64_t segment_id = 0;
-            uint32_t page_id = 0;
-            if (!ReadU64(bytes, cursor, segment_id) || !ReadU32(bytes, cursor, page_id)) {
-                return false;
-            }
-            if (segment_id > std::numeric_limits<uint32_t>::max()) {
-                return false;
-            }
-            partition.subtree_store.pages.push_back(
-                {static_cast<uint32_t>(segment_id), page_id});
+        if (descriptor_mode > static_cast<uint8_t>(
+                                  flowkv::hybrid_l1::RouteDescriptorMode::kNormalPack)) {
+            return false;
         }
+        partition.descriptor_mode =
+            static_cast<flowkv::hybrid_l1::RouteDescriptorMode>(descriptor_mode);
+        partition.tiny_enter_streak = tiny_enter_streak;
+        partition.tiny_leaf_value = tiny_leaf_value;
+        partition.pack_page_ptr = pack_page_ptr;
+        partition.pack_slot_id = pack_slot_id;
+        if (page_size > std::numeric_limits<uint16_t>::max()) {
+            return false;
+        }
+        partition.subtree_store.page_size = static_cast<uint16_t>(page_size);
+        partition.subtree_store.flags = subtree_store_flags;
+        partition.subtree_store.page_count = page_count;
+        partition.subtree_store.record_count = subtree_record_count;
+        partition.subtree_store.root_page_ptr = subtree_root_page_ptr;
+        partition.subtree_store.manifest_page_ptr = subtree_manifest_page_ptr;
         partitions.push_back(std::move(partition));
     }
     if (cursor != bytes.size()) {
@@ -941,11 +1239,28 @@ bool Version::ImportL1HybridState(const std::vector<uint8_t>& bytes, uint32_t ex
         return false;
     }
 
+    if (level1_table_by_block_.empty()) {
+        // Tableless recovery mode: synthesize block catalog from persisted records.
+        RebuildLevel1TableMapFromRecords();
+        return true;
+    }
+
     std::vector<flowkv::hybrid_l1::SubtreeRecord> fragments;
     level1_tree_->ExportLocalFragments(fragments);
     for (const auto& fragment : fragments) {
-        if (fragment.table_idx >= level1_tables_.size() ||
-            !level1_tables_[fragment.table_idx].Valid()) {
+        TaggedPstMeta resolved;
+        if (!ResolveL1RecordToTableMeta(fragment, resolved)) {
+            // Compatibility fallback: if manifest-derived map is stale, rebuild
+            // map from persisted records once and retry validation.
+            RebuildLevel1TableMapFromRecords();
+            break;
+        }
+    }
+
+    level1_tree_->ExportLocalFragments(fragments);
+    for (const auto& fragment : fragments) {
+        TaggedPstMeta resolved;
+        if (!ResolveL1RecordToTableMeta(fragment, resolved)) {
             RebuildLevel1Tree();
             return false;
         }
@@ -955,16 +1270,44 @@ bool Version::ImportL1HybridState(const std::vector<uint8_t>& bytes, uint32_t ex
 
 void Version::RebuildLevel1Tree()
 {
-    level1_tree_->BulkLoadFromTables(level1_tables_);
+    std::vector<TaggedPstMeta> active_tables;
+    CollectActiveLevel1Tables(active_tables);
+    level1_tree_->BulkLoadFromTables(active_tables);
 }
 
 void Version::RebuildLevel1Partitions(const std::vector<KeyType>& changed_route_keys)
 {
-    if (level1_tree_->Empty()) {
-        RebuildLevel1Tree();
+    RebuildLevel1Partitions(changed_route_keys, nullptr);
+}
+
+void Version::RebuildLevel1Partitions(
+    const std::vector<KeyType>& changed_route_keys,
+    const flowkv::hybrid_l1::L1DeltaBatch* delta_batch)
+{
+    if (delta_batch != nullptr && !delta_batch->Empty()) {
+        level1_tree_->RebuildPartitionsFromDelta(changed_route_keys, *delta_batch);
         return;
     }
-    level1_tree_->RebuildPartitionsFromTables(level1_tables_, changed_route_keys);
+    // Without delta payload, avoid table-driven partial rebuild fallback.
+    // Rebuild the full L1 tree from the current block map snapshot instead.
+    RebuildLevel1Tree();
+}
+
+void Version::QueueOrApplyL1Rebuild(const std::vector<KeyType>& changed_route_keys)
+{
+    if (changed_route_keys.empty()) {
+        return;
+    }
+    if (has_pending_l1_delta_batch_ && l1_batch_update_depth_ > 0) {
+        return;
+    }
+    if (l1_batch_update_depth_ > 0) {
+        pending_l1_changed_route_keys_.insert(pending_l1_changed_route_keys_.end(),
+                                              changed_route_keys.begin(),
+                                              changed_route_keys.end());
+        return;
+    }
+    RebuildLevel1Partitions(changed_route_keys);
 }
 
 std::vector<KeyType> Version::CollectChangedRouteKeysForTable(const PSTMeta& table) const

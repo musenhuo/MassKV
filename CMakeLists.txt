@@ -17,12 +17,6 @@ option(KV_SEPARATION "Enabling KV seaparation to support variable-sized value bu
 # Enable 16B fixed key support
 option(FLOWKV_KEY16 "Enable 16B fixed-length key support" OFF)
 
-# Use H-Masstree (a forked/modified Masstree copy under lib/hmasstree)
-option(USE_HMASSTREE "Use H-Masstree instead of the original Masstree" OFF)
-
-# H-Masstree external storage support
-option(HMASSTREE_EXTERNAL_STORAGE "Enable H-Masstree external storage mode" OFF)
-
 
 # set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -O0 -g -fstack-protector-all -fsanitize=address -mssse3 -mavx -mavx2 -mbmi2 -mlzcnt -mbmi -Wno-narrowing")
 # set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -O0 -g -fstack-protector-all -fsanitize=address -mssse3 -mavx -mavx2 -mbmi2 -mlzcnt -mbmi -Wno-narrowing")
@@ -44,12 +38,6 @@ add_library(masstree ${MASSTREE_SOURCE_FILES})
 target_compile_options(masstree PRIVATE
           $<$<COMPILE_LANGUAGE:CXX>:-include ${PROJECT_SOURCE_DIR}/lib/masstree/config.h>)
 
-# third-party: H-Masstree (forked Masstree)
-aux_source_directory(${PROJECT_SOURCE_DIR}/lib/hmasstree HMASSTREE_SOURCE_FILES)
-add_library(hmasstree ${HMASSTREE_SOURCE_FILES})
-target_compile_options(hmasstree PRIVATE
-          $<$<COMPILE_LANGUAGE:CXX>:-include ${PROJECT_SOURCE_DIR}/lib/hmasstree/config.h>)
-
 # hybrid L1 routing subtree
 aux_source_directory(${PROJECT_SOURCE_DIR}/lib/hybrid_l1 HYBRID_L1_SOURCE_FILES)
 add_library(hybrid_l1 ${HYBRID_L1_SOURCE_FILES})
@@ -64,19 +52,8 @@ include_directories(${PROJECT_SOURCE_DIR} ${PROJECT_SOURCE_DIR}/include)
 
 add_library(flowkv ${DB_FILES})
 
-if(USE_HMASSTREE)
-    message(STATUS "Using H-Masstree")
-    target_compile_definitions(flowkv PRIVATE USE_HMASSTREE)
-    if(HMASSTREE_EXTERNAL_STORAGE)
-        message(STATUS "HMASSTREE_EXTERNAL_STORAGE is ON")
-        target_compile_definitions(flowkv PRIVATE HMASSTREE_EXTERNAL_STORAGE)
-        target_compile_definitions(hmasstree PRIVATE HMASSTREE_EXTERNAL_STORAGE)
-    endif()
-    target_link_libraries(flowkv pmem pthread hmasstree hybrid_l1 ThreadPool)
-else()
     message(STATUS "Using original Masstree")
     target_link_libraries(flowkv pmem pthread masstree hybrid_l1 ThreadPool)
-endif()
 if(KV_SEPARATION)
     message(STATUS "KV_SEPARATION is ON")
     add_definitions(-DINDEX_LOG_MEMTABLE)

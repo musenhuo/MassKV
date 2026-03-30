@@ -33,6 +33,9 @@ bool unlocked_tcursor<P>::find_unlocked(threadinfo& ti)
     if (v_.deleted())
         goto retry;
 
+    if (unlikely(v_.cold()))
+        return false;
+
     n_->prefetch();
     perm_ = n_->permutation();
     kx = leaf<P>::bound_type::lower(ka_, *this);

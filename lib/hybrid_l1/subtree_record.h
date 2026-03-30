@@ -1,5 +1,6 @@
 #pragma once
 
+#include "db/blocks/fixed_size_block.h"
 #include "db/table.h"
 #include "prefix_suffix.h"
 
@@ -12,7 +13,9 @@ namespace flowkv::hybrid_l1 {
 /**
  * @brief L1 子树叶子中的路由记录。
  *
- * 该结构不存真实 value，只存将查询路由到 `level1_tables_` 所需的最小元数据。
+ * 该结构不存真实 value。
+ * 叶子 payload 直接编码最终 KV block 的物理块指针与块内窗口，
+ * 用于在读路径中直接完成 PST 块查询。
  */
 struct SubtreeRecord {
     struct LeafValueParts {
@@ -32,6 +35,11 @@ struct SubtreeRecord {
     static constexpr uint64_t kLeafValueBlockPtrMask =
         (1ULL << kLeafValueBlockPtrBits) - 1ULL;
     static constexpr uint32_t kKvBlockShift = 12;
+    static_assert(kLeafValueCountBits + kLeafValueOffsetBits + kLeafValueBlockPtrBits == 64,
+                  "leaf_value bit layout must occupy exactly 64 bits");
+    static_assert((1u << kKvBlockShift) == 4096, "KV block shift must encode 4KB blocks");
+    static_assert(PDataBlock::MAX_ENTRIES <= (1u << kLeafValueCountBits),
+                  "leaf window count bits are insufficient for PDataBlock entries");
 
     KeyType min_key{};
     KeyType max_key{};
@@ -216,6 +224,26 @@ struct RecordRouteKeyLess {
         const int cmp = CompareKeyType(lhs.RouteMaxKey(), rhs.RouteMaxKey());
         if (cmp != 0) {
             return cmp < 0;
+        }
+        if (lhs.seq_no != rhs.seq_no) {
+            return lhs.seq_no > rhs.seq_no;
+        }
+        return lhs.table_idx < rhs.table_idx;
+    }
+};
+
+struct RecordRouteSuffixLess {
+    bool operator()(const SubtreeRecord& lhs, RouteSuffix rhs) const {
+        return lhs.route_max_suffix < rhs;
+    }
+
+    bool operator()(RouteSuffix lhs, const SubtreeRecord& rhs) const {
+        return lhs < rhs.route_max_suffix;
+    }
+
+    bool operator()(const SubtreeRecord& lhs, const SubtreeRecord& rhs) const {
+        if (lhs.route_max_suffix != rhs.route_max_suffix) {
+            return lhs.route_max_suffix < rhs.route_max_suffix;
         }
         if (lhs.seq_no != rhs.seq_no) {
             return lhs.seq_no > rhs.seq_no;

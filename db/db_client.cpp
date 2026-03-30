@@ -58,12 +58,6 @@ bool MYDBClient::Put(const Slice key, const Slice value, bool slow)
 #else
     KeyType int_key = key.ToUint64();
 #endif
-    // if active log_group is changed, first allocate new segment
-    if (unlikely(memtable_idx_changed))
-    {
-        log_writer_->SwitchToNewSegment(current_memtable_idx_);
-    }
-
     LSN lsn;
 #ifdef INDEX_LOG_MEMTABLE
     lsn = db_->GetLSN(int_key);
@@ -71,7 +65,16 @@ bool MYDBClient::Put(const Slice key, const Slice value, bool slow)
 #ifdef BUFFER_WAL_MEMTABLE
     lsn = db_->LSN_lock(int_key);
 #endif
-    uint64_t log_ptr = log_writer_->WriteLogPut(key, value, lsn);
+    uint64_t log_ptr = 0;
+    {
+        std::lock_guard<std::mutex> lock(log_writer_mu_);
+        // if active log_group is changed, first allocate new segment
+        if (unlikely(memtable_idx_changed))
+        {
+            log_writer_->SwitchToNewSegment(current_memtable_idx_);
+        }
+        log_ptr = log_writer_->WriteLogPut(key, value, lsn);
+    }
     LOG("put log_ptr = %lu", log_ptr);
 
     // index updade
@@ -94,7 +97,14 @@ bool MYDBClient::Put(const Slice key, const Slice value, bool slow)
 }
 void MYDBClient::Persist_Log()
 {
+    std::lock_guard<std::mutex> lock(log_writer_mu_);
     log_writer_->PersistNowSegment();
+}
+
+bool MYDBClient::Persist_Log(int memtable_idx)
+{
+    std::lock_guard<std::mutex> lock(log_writer_mu_);
+    return log_writer_->PersistNowSegmentIfGroup(memtable_idx);
 }
 
 bool MYDBClient::Delete(const Slice key)
@@ -105,11 +115,6 @@ bool MYDBClient::Delete(const Slice key)
 #else
     KeyType int_key = key.ToUint64();
 #endif
-    // if active log_group is changed, first allocate new segment
-    if (unlikely(changed))
-    {
-        log_writer_->SwitchToNewSegment(current_memtable_idx_);
-    }
     LSN lsn;
 #ifdef INDEX_LOG_MEMTABLE
     lsn = db_->GetLSN(int_key);
@@ -117,7 +122,16 @@ bool MYDBClient::Delete(const Slice key)
 #ifdef BUFFER_WAL_MEMTABLE
     lsn = db_->LSN_lock(int_key);
 #endif
-    uint64_t log_ptr = log_writer_->WriteLogDelete(key, lsn);
+    uint64_t log_ptr = 0;
+    {
+        std::lock_guard<std::mutex> lock(log_writer_mu_);
+        // if active log_group is changed, first allocate new segment
+        if (unlikely(changed))
+        {
+            log_writer_->SwitchToNewSegment(current_memtable_idx_);
+        }
+        log_ptr = log_writer_->WriteLogDelete(key, lsn);
+    }
     LOG("put log_ptr = %lu", log_ptr);
 #ifdef INDEX_LOG_MEMTABLE
     ValuePtr vp{.detail_ = {.valid = 0,
@@ -188,7 +202,11 @@ MYDBClient::MemtableLookupResult MYDBClient::GetFromMemtable(const Slice key, Sl
         if (vptr.detail_.valid == 0)
             return MemtableLookupResult::kDeleted;
         // get from log - 直接写入调用方缓冲区避免悬空指针
-        size_t value_sz = log_writer_->ReadBufferedValue(key, vptr, (char*)value_out.data());
+        size_t value_sz = 0;
+        {
+            std::lock_guard<std::mutex> lock(log_writer_mu_);
+            value_sz = log_writer_->ReadBufferedValue(key, vptr, (char*)value_out.data());
+        }
         if (value_sz == 0)
         {
             value_sz = log_reader_->ReadLogForValue(key, vptr, (char*)value_out.data());
@@ -343,6 +361,10 @@ inline bool MYDBClient::StartWrite()
     // 1 get memtable idx
     int old = current_memtable_idx_;
     current_memtable_idx_ = db_->current_memtable_idx_;
+    const int writer_slot =
+        std::max(0, std::min(thread_id_, MAX_USER_THREAD_NUM - 1));
+    db_->memtable_states_[current_memtable_idx_].thread_write_states[writer_slot].store(
+        true, std::memory_order_release);
 	// if memtable is half-full or full, slow down or stop
     // if(put_num_in_current_memtable_[current_memtable_idx_] > MAX_MEMTABLE_ENTRIES/8){
     //     usleep(10);
@@ -364,5 +386,8 @@ inline bool MYDBClient::StartWrite()
 
 inline void MYDBClient::FinishWrite()
 {
-
+    const int writer_slot =
+        std::max(0, std::min(thread_id_, MAX_USER_THREAD_NUM - 1));
+    db_->memtable_states_[current_memtable_idx_].thread_write_states[writer_slot].store(
+        false, std::memory_order_release);
 }

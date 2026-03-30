@@ -37,69 +37,38 @@ FlushJob::~FlushJob()
 }
 bool FlushJob::run()
 {
-	// iterate index to get kv list
-	LOG("iterate index(scan2)");
-	std::vector<KeyType> keys;
-	std::vector<uint64_t> values; // TODO: try to avoid memory allocate/free overhead
-	#if defined(FLOWKV_KEY16)
-	memtable_index_->Scan2(KeyType{0, 0}, MAX_INT32, keys, values);
-	#else
-	memtable_index_->Scan2(0, MAX_INT32, keys, values);
-	#endif
-	LOG("scan2 result: size= %lu", keys.size());
+	LOG("iterate index (ForEachEntry)");
 	// build psts and version
 	LOG("add level0 tree");
-	tree_seq_no_ = version_->GetCurrentL0TreeSeq();
-	tree_idx_ = version_->AddLevel0Tree();
+	uint32_t tree_seq = 0;
+	tree_idx_ = version_->AddLevel0Tree(&tree_seq);
 	while (tree_idx_ == -1)
 	{
 		INFO("can't addlevel0tree, waiting...");
 		usleep(100000);
-		tree_idx_ = version_->AddLevel0Tree();
+		tree_idx_ = version_->AddLevel0Tree(&tree_seq);
 	}
-	LOG("tree_idx=%d, read log and build psts", tree_idx_);
-	PSTMeta meta;
-	ValuePtr vptr;
-	Slice key;
-	Slice value;
-#if defined(FLOWKV_KEY16)
-	Key16 k;
-	uint8_t k_bytes[16];
-#else
-	uint64_t k = 0;
-#endif
-	uint64_t v = 0;
-	FixedValue16 persisted_value{};
-	#if defined(FLOWKV_KEY16)
-	key = Slice(reinterpret_cast<const char *>(k_bytes), 16);
-	value = Slice(reinterpret_cast<const char *>(&persisted_value), sizeof(persisted_value));
-	#else
-	key = Slice(&k);
-	value = Slice(&v);
-	#endif
-#if defined(FLOWKV_KEY16)
-	DEBUG("will flush %lu keys", keys.size());
-#else
-	DEBUG("will flush %lu keys,key = %lu~%lu,", keys.size(), __bswap_64(keys[0]), __bswap_64(keys[keys.size() - 1]));
-#endif
+	tree_seq_no_ = tree_seq;
+	LOG("tree_idx=%d, streaming flush", tree_idx_);
 
 	int cur_partition = 0;
 	KeyType partition_max_key = partition_info_[cur_partition].max_key;
+	size_t flushed_count = 0;
 
-	for (size_t i = 0; i < keys.size(); i++)
-	{
-		k = keys[i];
+	memtable_index_->ForEachEntry([&](KeyType k, uint64_t val) -> bool {
+		// Prepare key slice
 #if defined(FLOWKV_KEY16)
-		// 16B key: encode to bytes for Slice
+		uint8_t k_bytes[16];
 		k.ToBigEndianBytes(k_bytes);
-		key = Slice(reinterpret_cast<const char *>(k_bytes), 16);
+		Slice key(reinterpret_cast<const char *>(k_bytes), 16);
 #else
-		// 8B key: use uint64_t directly
-		key = Slice(&k);
+		Slice key(&k);
 #endif
-		// DEBUG("aa:%lu", __bswap_64(k));
+		// Prepare value slice
+		FixedValue16 persisted_value{};
 #if defined(INDEX_LOG_MEMTABLE)
-		vptr.data_ = values[i];
+		ValuePtr vptr;
+		vptr.data_ = val;
 		if (!vptr.detail_.valid)
 		{
 			persisted_value = FixedValue16::Tombstone();
@@ -110,14 +79,18 @@ bool FlushJob::run()
 			if (log_reader_.ReadLogForValue(key, vptr, persisted_value.data()) == 0)
 				ERROR_EXIT("flush log value read should succeed");
 		}
+		Slice value(reinterpret_cast<const char *>(&persisted_value), sizeof(persisted_value));
 #else
-		v = values[i];
+		uint64_t v = val;
+		Slice value(&v);
 #endif
+		// Partition boundary check
 		while (unlikely(KeyTypeGreater(k, partition_max_key)))
 		{
 			FlushPST();
 			cur_partition++;
-			if(unlikely(cur_partition >= RANGE_PARTITION_NUM))ERROR_EXIT("key > max_key in the largest partition");
+			if (unlikely(cur_partition >= RANGE_PARTITION_NUM))
+				ERROR_EXIT("key > max_key in the largest partition");
 			partition_max_key = partition_info_[cur_partition].max_key;
 		}
 
@@ -128,10 +101,14 @@ bool FlushJob::run()
 			if (!pst_builder_.AddEntry(key, value))
 				ERROR_EXIT("cannot add pst entry in flush");
 		}
-	}
+		flushed_count++;
+		return true;
+	});
+
+	LOG("ForEachEntry flushed %lu entries", flushed_count);
 	FlushPST();
 	// now the new tree can be read
-	version_->UpdateLevel0ReadTail();
+	version_->PublishLevel0Tree(tree_idx_);
 	// delete obsolute index and log segments
 	std::vector<uint64_t> segment_list;
 	seg_allocater_->GetElementsFromLogGroup(seg_group_id_, &segment_list);
@@ -161,109 +138,57 @@ bool FlushJob::run()
 bool FlushJob::subrun(int partition_id)
 {
 	PSTBuilder *pst_builder = partition_pst_builder_[partition_id] = new PSTBuilder(seg_allocater_);
-	// iterate index to get kv list
-	LOG("iterate index(scan2)");
-	//INFO("partition_id=%d",partition_id);
-	std::vector<KeyType> keys;
-	std::vector<uint64_t> values; // TODO: try to avoid memory allocate/free overhead
-	//memtable_index_->Scan2(0, MAX_INT32, keys, values);
-	memtable_index_->ScanByRange(partition_info_[partition_id].min_key, partition_info_[partition_id].max_key, keys, values);
-	//INFO("%lu~%lu",__bswap_64(partition_info_[partition_id].min_key),__bswap_64(partition_info_[partition_id].max_key));
-	//INFO("scan2 result: size= %lu", keys.size());
-	// // build psts and version
-	// LOG("add level0 tree");
-	// tree_seq_no_ = version_->GetCurrentL0TreeSeq();
-	// tree_idx_ = version_->AddLevel0Tree();
-	// while (tree_idx_ == -1)
-	// {
-	// 	INFO("can't addlevel0tree, waiting...");
-	// 	usleep(100000);
-	// 	tree_idx_ = version_->AddLevel0Tree();
-	// }
-	// LOG("tree_idx=%d, read log and build psts", tree_idx_);
-	//INFO("OKKKpartition_id=%d",partition_id);
+	LOG("streaming flush partition %d", partition_id);
 
-    // meta_ =
-    //     {
-    //         .datablock_ptr_ = 0,
-    //         .max_key_ = 0,
-    //         .min_key_ = MAX_UINT64,
-    //         .entry_num_ = 0};
-	TaggedPstMeta tmeta;
-
-
-
-
-	PSTMeta meta;
-	ValuePtr vptr;
-	Slice key;
-	Slice value;
+	memtable_index_->ForEachEntryInRange(
+		partition_info_[partition_id].min_key,
+		partition_info_[partition_id].max_key,
+		[&](KeyType k, uint64_t val) -> bool {
 #if defined(FLOWKV_KEY16)
-	Key16 k;
-	uint8_t k_bytes[16];
+			uint8_t k_bytes[16];
+			k.ToBigEndianBytes(k_bytes);
+			Slice key(reinterpret_cast<const char *>(k_bytes), 16);
 #else
-	uint64_t k = 0;
+			Slice key(&k);
 #endif
-	uint64_t v = 0;
-	FixedValue16 persisted_value{};
-	#if defined(FLOWKV_KEY16)
-	key = Slice(reinterpret_cast<const char *>(k_bytes), 16);
-	value = Slice(reinterpret_cast<const char *>(&persisted_value), sizeof(persisted_value));
-	#else
-	key = Slice(&k);
-	value = Slice(&v);
-	#endif
-#if defined(FLOWKV_KEY16)
-	DEBUG("will flush %lu keys", keys.size());
-#else
-	DEBUG("will flush %lu keys,key = %lu~%lu,", keys.size(), __bswap_64(keys[0]), __bswap_64(keys[keys.size() - 1]));
-#endif
-
-	for (size_t i = 0; i < keys.size(); i++)
-	{
-		k = keys[i];
-#if defined(FLOWKV_KEY16)
-		k.ToBigEndianBytes(k_bytes);
-		key = Slice(reinterpret_cast<const char *>(k_bytes), 16);
-#else
-		key = Slice(&k);
-#endif
-		// DEBUG("aa:%lu", __bswap_64(k));
+			FixedValue16 persisted_value{};
 #if defined(INDEX_LOG_MEMTABLE)
-		vptr.data_ = values[i];
-		if (!vptr.detail_.valid)
-		{
-			persisted_value = FixedValue16::Tombstone();
-		}
-		else
-		{
-			persisted_value = {};
-			if (log_reader_.ReadLogForValue(key, vptr, persisted_value.data()) == 0)
-				ERROR_EXIT("flush log value read should succeed");
-		}
-#else
-		v = values[i];
-#endif
-		bool success = pst_builder->AddEntry(key, value);
-		if (!success)
-		{
-			auto meta = pst_builder->Flush();
-			meta.seq_no_ = tree_seq_no_;
-			if (meta.Valid())
+			ValuePtr vptr;
+			vptr.data_ = val;
+			if (!vptr.detail_.valid)
 			{
-				TaggedPstMeta tmeta;
-				tmeta.meta = meta;
-				tmeta.level = 0;
-				// tmeta.manifest_position = manifest_->AddTable(meta, 0);
-				// version_->InsertTableToL0(tmeta, tree_idx_);
-				// output_pst_list_.push_back(tmeta);
-				partition_outputs_[partition_id].emplace_back(tmeta);
+				persisted_value = FixedValue16::Tombstone();
 			}
-			if (!pst_builder->AddEntry(key, value))
-				ERROR_EXIT("cannot add pst entry in flush");
-		}
-	}
-	meta = pst_builder->Flush();
+			else
+			{
+				persisted_value = {};
+				if (log_reader_.ReadLogForValue(key, vptr, persisted_value.data()) == 0)
+					ERROR_EXIT("flush log value read should succeed");
+			}
+			Slice value(reinterpret_cast<const char *>(&persisted_value), sizeof(persisted_value));
+#else
+			uint64_t v = val;
+			Slice value(&v);
+#endif
+			bool success = pst_builder->AddEntry(key, value);
+			if (!success)
+			{
+				auto meta = pst_builder->Flush();
+				meta.seq_no_ = tree_seq_no_;
+				if (meta.Valid())
+				{
+					TaggedPstMeta tmeta;
+					tmeta.meta = meta;
+					tmeta.level = 0;
+					partition_outputs_[partition_id].emplace_back(tmeta);
+				}
+				if (!pst_builder->AddEntry(key, value))
+					ERROR_EXIT("cannot add pst entry in flush");
+			}
+			return true;
+		});
+
+	auto meta = pst_builder->Flush();
 	meta.seq_no_ = tree_seq_no_;
 	if (meta.Valid())
 	{
@@ -284,14 +209,15 @@ bool FlushJob::subrunParallel()
 {
 	// build psts and version
 	LOG("add level0 tree");
-	tree_seq_no_ = version_->GetCurrentL0TreeSeq();
-	tree_idx_ = version_->AddLevel0Tree();
+	uint32_t tree_seq = 0;
+	tree_idx_ = version_->AddLevel0Tree(&tree_seq);
 	while (tree_idx_ == -1)
 	{
 		INFO("can't addlevel0tree, waiting...");
 		usleep(100000);
-		tree_idx_ = version_->AddLevel0Tree();
+		tree_idx_ = version_->AddLevel0Tree(&tree_seq);
 	}
+	tree_seq_no_ = tree_seq;
 	LOG("tree_idx=%d, read log and build psts", tree_idx_);
 
 	for (int i = 0; i < RANGE_PARTITION_NUM; i++)
@@ -313,7 +239,7 @@ bool FlushJob::subrunParallel()
 		delete partition_pst_builder_[i];
 	}
 	// now the new tree can be read
-	version_->UpdateLevel0ReadTail();
+	version_->PublishLevel0Tree(tree_idx_);
 	// delete obsolute index and log segments
 	std::vector<uint64_t> segment_list;
 	seg_allocater_->GetElementsFromLogGroup(seg_group_id_, &segment_list);

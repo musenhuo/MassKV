@@ -3,11 +3,18 @@
 #include "db/table.h"
 
 #include <cstdint>
+#include <type_traits>
 
 namespace flowkv::hybrid_l1 {
 
 using RoutePrefix = uint64_t;
 using RouteSuffix = uint64_t;
+
+static_assert(sizeof(RoutePrefix) == 8, "RoutePrefix must be 8 bytes");
+static_assert(sizeof(RouteSuffix) == 8, "RouteSuffix must be 8 bytes");
+#if defined(FLOWKV_KEY16)
+static_assert(sizeof(KeyType) == 16, "FLOWKV_KEY16 mode requires 16-byte KeyType");
+#endif
 
 inline RoutePrefix ExtractPrefix(const KeyType& key) {
 #if defined(FLOWKV_KEY16)

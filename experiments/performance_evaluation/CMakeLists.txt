@@ -1,1 +1,2 @@
 add_subdirectory(01_point_lookup)
+add_subdirectory(03_compaction_update)

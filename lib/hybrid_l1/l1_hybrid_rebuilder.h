@@ -1,5 +1,6 @@
 #pragma once
 
+#include "l1_delta_batch.h"
 #include "route_layout.h"
 #include "subtree_record.h"
 
@@ -17,6 +18,7 @@ enum class PartitionUpdateMode : uint8_t {
 
 struct PartitionUpdatePolicy {
     bool enable_cow = true;
+    bool enable_leaf_stream_bulk_load = false;
     size_t small_tree_record_threshold = 256;
     size_t cow_max_changed_records = 64;
     size_t cow_max_leaf_spans = 4;
@@ -43,6 +45,28 @@ struct PartitionUpdateDecision {
 
 class L1HybridRebuilder {
 public:
+    struct IndexUpdateStats {
+        uint64_t delta_prefix_count = 0;
+        uint64_t delta_ops_count = 0;
+        uint64_t effective_delta_prefix_count = 0;
+        uint64_t effective_delta_ops_count = 0;
+        double index_update_total_ms = 0.0;
+        double index_update_cow_ms = 0.0;
+        double index_update_bulk_ms = 0.0;
+        uint64_t cow_prefix_count = 0;
+        uint64_t bulk_prefix_count = 0;
+        double leaf_stream_merge_ms = 0.0;
+        uint64_t rebuild_fallback_count = 0;
+        uint64_t tiny_descriptor_count = 0;
+        uint64_t normal_pack_count = 0;
+        double tiny_hit_ratio = 0.0;
+        uint64_t dirty_pack_pages = 0;
+        uint64_t pack_write_bytes = 0;
+    };
+
+    static IndexUpdateStats GetIndexUpdateStats();
+    static void ResetIndexUpdateStats();
+
     static void ResetPartitions(std::vector<RoutePartition>& partitions);
     static void ResetPartitions(std::vector<RoutePartition>& partitions,
                                 SegmentAllocator* segment_allocator);
@@ -52,6 +76,7 @@ public:
                          const FixedRouteLayout& layout,
                          const L1SubtreeBPTree::BuildOptions& subtree_options,
                          uint32_t subtree_page_size,
+                         // Required in SSD-resident mode.
                          SegmentAllocator* segment_allocator,
                          const PrefixGovernancePolicy& governance_policy,
                          size_t& size,
@@ -76,6 +101,7 @@ public:
                                             SegmentAllocator* segment_allocator,
                                             const PartitionUpdatePolicy& update_policy,
                                             const PrefixGovernancePolicy& governance_policy,
+                                            const L1DeltaBatch* delta_batch,
                                             size_t& size,
                                             uint64_t& generation);
 
@@ -87,12 +113,21 @@ private:
                                          const L1SubtreeBPTree::BuildOptions& subtree_options,
                                          uint32_t subtree_page_size,
                                          SegmentAllocator* segment_allocator,
-                                         const PrefixGovernancePolicy& governance_policy);
+                                         const PrefixGovernancePolicy& governance_policy,
+                                         const RoutePartition* existing_partition = nullptr);
     static PartitionUpdateDecision ChooseUpdateMode(const RoutePartition* existing_partition,
                                                     const std::vector<SubtreeRecord>& target_records,
                                                     const L1SubtreeBPTree::BuildOptions& subtree_options,
-                                                    const PartitionUpdatePolicy& update_policy);
+                                                    const PartitionUpdatePolicy& update_policy,
+                                                    size_t delta_op_count);
+    static bool BuildRecordsFromDelta(RoutePrefix prefix,
+                                      const RoutePartition* existing_partition,
+                                      const std::vector<L1DeltaOp>& delta_ops,
+                                      const L1SubtreeBPTree::BuildOptions& subtree_options,
+                                      SegmentAllocator* segment_allocator,
+                                      std::vector<SubtreeRecord>& out_records);
     static RoutePartition ApplyBulkLoadUpdate(RoutePrefix prefix,
+                                              const RoutePartition* existing_partition,
                                               const std::vector<SubtreeRecord>& records,
                                               uint64_t generation,
                                               const L1SubtreeBPTree::BuildOptions& subtree_options,

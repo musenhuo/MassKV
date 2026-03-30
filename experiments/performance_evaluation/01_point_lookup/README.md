@@ -16,7 +16,8 @@
   - 当前点查询结果可直接用于 `16B key + 16B value` 的论文主实验
 - V4 路径补充：
   - RouteLayer 内存驻留
-  - Subtree 查询路径已切到磁盘句柄按需加载（含 LRU cache）
+  - 路由跳转已收敛为 `prefix -> root_page_ptr`（无 `partition_idx` 中间层）
+  - Subtree 查询路径为 SSD 页级读取（可选 LRU subtree cache）
   - 点查主路径已收紧为 `root->leaf` 逐页 I/O（优先使用句柄内 root 元数据）
   - 仅 legacy 快照（无 root 元数据）回退一次 manifest 读取
   - benchmark-only 快速建库模式：
@@ -44,6 +45,8 @@
 - `avg_io_pst_reads_top1pct_latency`
 - `rss_bytes`
 - `l1_index_bytes_estimated`
+- `l1_index_bytes_measured`
+- `l1_route_index_measured_bytes`
 - `l1_subtree_cache_bytes`
 - `l1_subtree_cache_requests`
 - `l1_subtree_cache_hits`
@@ -63,7 +66,9 @@
 其中：
 
 - `rss_bytes` 来自进程 RSS
-- `l1_index_bytes_estimated` 来自实验专用的 L1 内存估算接口
+- `l1_index_bytes_estimated` 为 L1 索引估算值（当前固定仅统计 `route Masstree`，即 `l1_route_index_estimated_bytes`）
+- `l1_index_bytes_measured` 为 L1 索引实际测量值（仅统计 **RAM 中 layer0 热路由**）
+- `l1_route_cold_ssd_bytes` 为 route 冷页在 SSD 的占用，**不计入内存开销**
 - `l1_subtree_cache_bytes` 表示 L1 subtree query cache 当前估算占用
 - `l1_subtree_cache_*` 用于量化 warm/cold 与缓存收益
 - `l1_cow_*` 用于量化 CoW 复用率与写放大
@@ -87,7 +92,8 @@
 - `RESULTS.md` 必须包含以下固定章节（按顺序）：
   - `Run Scope`
   - `Raw Result Table`
-  - `Memory Overhead Table`
+  - `Memory Overhead Table (RAM Only, Counted)`
+  - `Diagnostic Footprint Table (Not Counted into RAM Layer0 Metric)`
   - `Initial Observations`
   - `Change Comparison`（若本次涉及实现/结构改动则必填）
   - `Figures`
@@ -95,13 +101,19 @@
   - `Complete Metrics (CSV Dump)`
 - `Raw Result Table` 必须包含内存列：
   - `RSS (bytes)`
-  - `L1 Index Memory (bytes)`（`l1_index_bytes_estimated`）
-- `Memory Overhead Table` 必须至少包含：
-  - `l1_route_partition_bytes`
+  - `L1 Index Memory (bytes)`（`l1_index_bytes_estimated`，读路径口径）
+- `Memory Overhead Table (RAM Only, Counted)` 必须至少包含：
+  - `l1_route_index_measured_bytes`
+  - `l1_route_hot_root_index_measured_bytes`
+  - `l1_route_hot_descriptor_index_measured_bytes`
   - `l1_route_index_estimated_bytes`
+- `Diagnostic Footprint Table (Not Counted into RAM Layer0 Metric)` 必须至少包含：
+  - `l1_route_partition_bytes`
+  - `l1_route_cold_ssd_bytes`
   - `l1_subtree_bytes`
   - `l1_subtree_cache_bytes`
   - `l1_governance_bytes`
+  - 说明：上述诊断列不并入 `l1_index_bytes_measured`（RAM layer0 口径）
 - `Initial Observations` 至少给出 3 条结论：
   - 延迟/吞吐趋势
   - I/O 路径与计数一致性
@@ -147,7 +159,7 @@
   - `L1HybridIndex` 已支持可控 subtree page cache（LRU）
   - `PersistCow` + `DestroyUnshared` 已接入页级 CoW 发布路径
   - manifest 已支持 L1 hybrid 句柄快照恢复协议（含 seq/checksum envelope 校验）
-  - `subtree_pages_cache` 仅用于 allocator 未接入的 debug/unit-test 场景
+  - 索引路径不再维护内存回退模式（SSD-only）
 - 后续可继续接入：
   - 原始单层 L1
   - 去掉 prefix routing 的消融版

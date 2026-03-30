@@ -27,6 +27,7 @@
 #include <string>
 #include <stdexcept>
 #include <regex>
+#include <unordered_set>
 
 /**
  * @brief 打印当前进程的 DRAM（RSS）占用。
@@ -265,6 +266,114 @@ public:
         }
     };
 
+#if defined(FLOWKV_KEY16)
+    struct Scanner2U64
+    {
+        const int cnt;
+        std::vector<table_params::value_type> &vec;
+        std::vector<uint64_t> &k_vec;
+
+        Scanner2U64(int cnt, std::vector<uint64_t> &k, std::vector<table_params::value_type> &v)
+            : cnt(cnt), vec(v), k_vec(k)
+        {
+            vec.reserve(cnt);
+            k_vec.reserve(cnt);
+        }
+
+        template <typename SS, typename K>
+        void visit_leaf(const SS &, const K &, threadinfo &) {}
+
+        bool visit_value(Str key, table_params::value_type val, threadinfo &)
+        {
+            const uint64_t kint = *(const uint64_t *)key.data();
+            vec.push_back(val);
+            k_vec.emplace_back(kint);
+            if (vec.size() == cnt)
+            {
+                return false;
+            }
+            return true;
+        }
+    };
+
+    struct Scanner3U64
+    {
+        Str end;
+        std::vector<table_params::value_type> &vec;
+        std::vector<uint64_t> &k_vec;
+
+        Scanner3U64(Str end_key, std::vector<uint64_t> &k, std::vector<table_params::value_type> &v)
+            : end(end_key), vec(v), k_vec(k)
+        {
+        }
+
+        template <typename SS, typename K>
+        void visit_leaf(const SS &, const K &, threadinfo &) {}
+
+        bool visit_value(Str key, table_params::value_type val, threadinfo &)
+        {
+            if (key > end)
+            {
+                return false;
+            }
+            const uint64_t kint = *(const uint64_t *)key.data();
+            vec.push_back(val);
+            k_vec.emplace_back(kint);
+            return true;
+        }
+    };
+#endif
+
+    /**
+     * @brief ForEach Scanner：对每条 entry 调用用户 callback，不分配临时 vector。
+     */
+    struct ScannerForEach
+    {
+        std::function<bool(KeyType, table_params::value_type)> &callback;
+
+        ScannerForEach(std::function<bool(KeyType, table_params::value_type)> &cb)
+            : callback(cb) {}
+
+        template <typename SS, typename K>
+        void visit_leaf(const SS &, const K &, threadinfo &) {}
+
+        bool visit_value(Str key, table_params::value_type val, threadinfo &)
+        {
+#if defined(FLOWKV_KEY16)
+            KeyType kint = Key16::FromBigEndianBytes((const uint8_t *)key.data());
+#else
+            KeyType kint = *(KeyType *)key.data();
+#endif
+            return callback(kint, val);
+        }
+    };
+
+    /**
+     * @brief ForEach Range Scanner：在 [start, end] 范围内对每条 entry 调用 callback。
+     */
+    struct ScannerForEachRange
+    {
+        Str end;
+        std::function<bool(KeyType, table_params::value_type)> &callback;
+
+        ScannerForEachRange(Str end_key, std::function<bool(KeyType, table_params::value_type)> &cb)
+            : end(end_key), callback(cb) {}
+
+        template <typename SS, typename K>
+        void visit_leaf(const SS &, const K &, threadinfo &) {}
+
+        bool visit_value(Str key, table_params::value_type val, threadinfo &)
+        {
+            if (key > end) return false;
+#if defined(FLOWKV_KEY16)
+            KeyType kint = Key16::FromBigEndianBytes((const uint8_t *)key.data());
+#else
+            KeyType kint = *(KeyType *)key.data();
+#endif
+            return callback(kint, val);
+        }
+    };
+
     // static thread_local typename table_params::threadinfo_type *ti;
 
     /**
@@ -383,6 +492,24 @@ public:
         lp.finish(1, *ti);
     }
 
+#if defined(FLOWKV_KEY16)
+    void insert(uint64_t int_key, ValueHelper &le_helper)
+    {
+        uint64_t key_buf;
+        Str key = make_key(int_key, key_buf);
+        cursor_type lp(table_, key);
+        table_params::threadinfo_type *ti = get_ti();
+        bool found = lp.find_insert(*ti);
+        if (found)
+        {
+            le_helper.old_val = lp.value();
+        }
+        lp.value() = le_helper.new_val;
+        fence();
+        lp.finish(1, *ti);
+    }
+#endif
+
     /**
      * @brief 带校验的插入/更新：按 LSN 单调性决定是否覆盖旧值。
      *
@@ -439,6 +566,16 @@ public:
         return found;
     }
 
+#if defined(FLOWKV_KEY16)
+    bool search(uint64_t int_key, uint64_t &value)
+    {
+        table_params::threadinfo_type *ti = get_ti();
+        uint64_t key_buf;
+        Str key = make_key(int_key, key_buf);
+        return table_.get(key, value, *ti);
+    }
+#endif
+
     /**
      * @brief 从 int_key（含）开始扫描，最多返回 cnt 个 value。
      * @param int_key 起始 key。
@@ -480,6 +617,17 @@ public:
         table_.scan(key, true, scanner, *ti);
     }
 
+#if defined(FLOWKV_KEY16)
+    void scan(uint64_t int_key, int cnt, std::vector<uint64_t> &kvec, std::vector<uint64_t> &vvec)
+    {
+        table_params::threadinfo_type *ti = get_ti();
+        uint64_t key_buf;
+        Str key = make_key(int_key, key_buf);
+        Scanner2U64 scanner(cnt, kvec, vvec);
+        table_.scan(key, true, scanner, *ti);
+    }
+#endif
+
     /**
      * @brief 扫描范围 [start, end] 内的 key/value（按有序遍历）。
      *
@@ -506,6 +654,54 @@ public:
         table_.scan(start_str, true, scanner, *ti);
     }
 
+#if defined(FLOWKV_KEY16)
+    void scan(uint64_t start, uint64_t end, std::vector<uint64_t> &kvec, std::vector<uint64_t> &vvec)
+    {
+        table_params::threadinfo_type *ti = get_ti();
+        uint64_t start_buf, end_buf;
+        Str start_str = make_key(start, start_buf);
+        Str end_str = make_key(end, end_buf);
+        Scanner3U64 scanner(end_str, kvec, vvec);
+        table_.scan(start_str, true, scanner, *ti);
+    }
+#endif
+
+    /**
+     * @brief 从 int_key 开始遍历所有 entry，对每条调用 callback。
+     */
+    void for_each(KeyType int_key, std::function<bool(KeyType, uint64_t)> callback)
+    {
+        table_params::threadinfo_type *ti = get_ti();
+#if defined(FLOWKV_KEY16)
+        uint8_t key_buf[16];
+        Str key = make_key(int_key, key_buf);
+#else
+        uint64_t key_buf;
+        Str key = make_key(int_key, key_buf);
+#endif
+        ScannerForEach scanner(callback);
+        table_.scan(key, true, scanner, *ti);
+    }
+
+    /**
+     * @brief 在 [start, end] 范围内遍历 entry，对每条调用 callback。
+     */
+    void for_each_range(KeyType start, KeyType end, std::function<bool(KeyType, uint64_t)> callback)
+    {
+        table_params::threadinfo_type *ti = get_ti();
+#if defined(FLOWKV_KEY16)
+        uint8_t start_buf[16], end_buf[16];
+        Str start_str = make_key(start, start_buf);
+        Str end_str = make_key(end, end_buf);
+#else
+        uint64_t start_buf, end_buf;
+        Str start_str = make_key(start, start_buf);
+        Str end_str = make_key(end, end_buf);
+#endif
+        ScannerForEachRange scanner(end_str, callback);
+        table_.scan(start_str, true, scanner, *ti);
+    }
+
     /**
      * @brief 删除指定 key。
      *
@@ -528,6 +724,169 @@ public:
         bool found = lp.find_locked(*ti);
         lp.finish(-1, *ti);
         return true;
+    }
+
+    /**
+     * @brief Estimate actual memory bytes used by this Masstree instance.
+     *
+     * This traverses the current tree structure and sums:
+     * - leaf allocated bytes
+     * - internode bytes
+     * - external ksuffix bags (if any)
+     *
+     * @note For route-layer (8B prefix) this reflects real node footprint,
+     *       not a per-entry model estimate.
+     */
+    size_t EstimateMemoryUsageBytes() const
+    {
+        using node_ptr = const node_type *;
+        std::unordered_set<node_ptr> visited;
+        std::vector<node_ptr> stack;
+        size_t total_bytes = 0;
+
+        node_ptr root = table_.root();
+        if (root == nullptr)
+        {
+            return 0;
+        }
+        stack.push_back(root);
+
+        while (!stack.empty())
+        {
+            node_ptr node = stack.back();
+            stack.pop_back();
+            if (node == nullptr || !visited.insert(node).second)
+            {
+                continue;
+            }
+
+            if (node->isleaf())
+            {
+                // Skip cold stubs — they are not real leaf nodes
+                auto nv = node->stable(relax_fence_function());
+                if (nv.cold()) {
+                    continue;
+                }
+                const auto *leaf = static_cast<const leaf_type *>(node);
+                total_bytes += leaf->allocated_size();
+                if (leaf->ksuf_ != nullptr)
+                {
+                    total_bytes += leaf->ksuf_->capacity();
+                }
+
+                const auto perm = leaf->permutation();
+                for (int r = 0; r < perm.size(); ++r)
+                {
+                    const int p = perm[r];
+                    const int keylenx = leaf->keylenx_[p];
+                    if (leaf_type::keylenx_is_layer(keylenx))
+                    {
+                        auto *layer = reinterpret_cast<node_ptr>(leaf->lv_[p].layer());
+                        if (layer != nullptr)
+                        {
+                            stack.push_back(layer);
+                        }
+                    }
+                }
+                continue;
+            }
+
+            const auto *internode = static_cast<const internode_type *>(node);
+            total_bytes += sizeof(*internode);
+            const int nkeys = internode->size();
+            for (int i = 0; i <= nkeys; ++i)
+            {
+                auto *child = reinterpret_cast<node_ptr>(internode->child_[i]);
+                if (child != nullptr)
+                {
+                    stack.push_back(child);
+                }
+            }
+        }
+
+        return total_bytes;
+    }
+
+    /**
+     * @brief Cold-aware search: returns the node_base pointer when a cold stub is hit.
+     *
+     * @param int_key  Key to look up (uint64_t prefix).
+     * @param value    Output value if found in a hot leaf.
+     * @param cold_node Output: set to the cold stub node_base* if hit, nullptr otherwise.
+     * @return true if found in hot leaf; false if not found or cold stub hit.
+     *         When false, check cold_node != nullptr to distinguish cold vs absent.
+     */
+    bool search_cold_aware(uint64_t int_key, uint64_t &value, node_type *&cold_node)
+    {
+        table_params::threadinfo_type *ti = get_ti();
+        uint64_t key_buf;
+        Str key = make_key(int_key, key_buf);
+
+        unlocked_cursor_type lp(table_, key);
+        bool found = lp.find_unlocked(*ti);
+        if (found) {
+            value = lp.value();
+            cold_node = nullptr;
+            return true;
+        }
+        // find_unlocked returned false — check if we landed on a cold stub
+        auto *n = lp.node();
+        if (n != nullptr) {
+            auto v = n->stable(relax_fence_function());
+            if (v.cold()) {
+                cold_node = n;
+                return false;
+            }
+        }
+        cold_node = nullptr;
+        return false;
+    }
+
+    /**
+     * @brief Walk the leaf linked list, calling fn(leaf*) for each leaf.
+     *
+     * Traverses from the leftmost leaf via next_ pointers.
+     * For cold stubs, the callback receives a node_base* that is NOT a real leaf.
+     * Use IsColdLeafStub() to detect.
+     *
+     * @param fn  Callback: void(node_type* node, bool is_cold)
+     */
+    template <typename Fn>
+    void ForEachLeaf(Fn&& fn) const
+    {
+        node_type* root = const_cast<node_type*>(table_.root());
+        if (!root) return;
+
+        // Descend to leftmost leaf
+        node_type* n = root;
+        while (true) {
+            auto v = n->stable(relax_fence_function());
+            if (v.isleaf()) break;
+            auto* in = static_cast<const internode_type*>(n);
+            n = const_cast<node_type*>(static_cast<const node_type*>(in->child_[0]));
+            if (!n) return;
+        }
+
+        // Walk the leaf chain
+        while (n) {
+            auto v = n->stable(relax_fence_function());
+            bool is_cold = v.cold();
+            fn(n, is_cold);
+            if (is_cold) {
+                // Cold stubs don't have next_ at the leaf offset.
+                // We stop here — caller should use cold_stubs_ list for cold iteration.
+                break;
+            }
+            auto* leaf = static_cast<leaf_type*>(n);
+            n = leaf->safe_next();
+        }
+    }
+
+    /**
+     * @brief Get the root node of the underlying Masstree.
+     */
+    node_type* root() const {
+        return const_cast<node_type*>(table_.root());
     }
 
 private:

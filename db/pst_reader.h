@@ -27,7 +27,6 @@ public:
                           Slice key,
                           const char *value_out,
                           int *value_size,
-                          uint16_t entry_num,
                           uint16_t start_entry,
                           uint16_t entry_count);
     

@@ -13,6 +13,82 @@
 
 ## 当前有效结果
 
+- 新增收敛（`2026-03-10`，SSD-only 主路径）：
+  - 结构收敛：
+    - `RoutePartition` 已移除 `subtree_pages_cache` 字段，仅保留 `subtree_store` 句柄。
+    - `L1HybridIndex` 构造强制要求 `segment_allocator != nullptr`。
+  - 查询路径收敛：
+    - `LookupCandidate/LookupCandidates` 仅走页级磁盘路径。
+    - `RangeScan` 仅走页级磁盘路径（失败即返回失败，不再回退整树导入）。
+  - 统计口径收敛：
+    - `l1_governance_bytes` 不再重复计入（已包含在 `route_partition_bytes`）。
+  - 验证：
+    - 编译通过：`hybrid_l1`、`hybrid_l1_test`、`version_l1_selection_test`
+    - 运行通过：
+      - `./build_hybrid_check/tests/hybrid_l1_test`
+      - `./build_hybrid_check/tests/version_l1_selection_test`
+  - 说明：
+    - 全量构建仍会被 `hmasstree` 目标中的历史重复定义问题阻塞（与本次收敛无关）。
+
+- 新增点查询实验（`20260309_091827`，10M + 连续数组只读快照后复测）：
+  - 配置：
+    - `key_count=10,000,000`
+    - `query_count=1,000,000`
+    - `distribution=uniform`
+    - `threads=1`
+    - `build_mode=fast_bulk_l1`
+    - `prefix_ratio=0.1N/0.05N/0.01N`
+    - `use_direct_io=1`
+    - `warmup_queries=0`
+    - `subtree_cache_capacity=256`
+    - `subtree_cache_max_bytes=256MB`
+    - `bitmap_persist_every=1024`
+    - `pst_nowait_poll=0`
+  - 结果：
+    - `0.1N`: `avg=168976ns`, `p99=2063142ns`, `throughput=5907.57 ops/s`
+    - `0.05N`: `avg=135316ns`, `p99=1830452ns`, `throughput=7372.34 ops/s`
+    - `0.01N`: `avg=87495ns`, `p99=227266ns`, `throughput=11399.6 ops/s`
+    - `avg_io_l1_pages_per_query` 三档均为 `1`
+    - `avg_io_pst_reads_per_query` 三档约 `0.994~0.997`
+  - 对比上一组可比实验（`20260308_132322`）：
+    - I/O 次数基本不变（路径一致）
+    - `l1_index_bytes_estimated` 降幅：
+      - `0.1N`: `-29.69%`
+      - `0.05N`: `-29.69%`
+      - `0.01N`: `-38.35%`
+  - 产物路径：
+    - [RESULTS.md](/home/zwt/yjy/FlowKV/experiments/performance_evaluation/01_point_lookup/results/20260309_091827/RESULTS.md)
+    - [results.csv](/home/zwt/yjy/FlowKV/experiments/performance_evaluation/01_point_lookup/results/20260309_091827/results.csv)
+    - [plots](/home/zwt/yjy/FlowKV/experiments/performance_evaluation/01_point_lookup/results/20260309_091827/plots)
+- 新增（2026-03-09，连续数组 + 32B 对齐 + 只读结构）：
+  - `L1HybridIndex` 已新增只读发布快照 `PublishedSnapshot`：
+    - `routes`：`alignas(32)` 的连续描述符数组 `PublishedRoutePartition`
+    - `page_refs`：共享连续页引用池
+  - 点查/范围查磁盘路径已改为读取快照切片（`SubtreePageStoreView`），不再依赖每个 partition 的 `pages vector`。
+  - publish 后会释放 partition 自带 `pages vector`；在 `Clear/BulkLoad/Rebuild` 前按需 materialize，保证 CoW/回收流程兼容。
+  - 本地验证：
+    - 编译通过：`point_lookup_benchmark`
+    - 测试通过：`hybrid_l1_test`、`version_l1_selection_test`
+    - 小规模 sanity（`100k keys/10k prefixes/50k queries`）：
+      - `avg_latency_ns=217918`
+      - `p99_latency_ns=450484`
+      - `avg_io_l1_pages_per_query=1`
+      - `avg_io_pst_reads_per_query=0.99568`
+      - `l1_index_bytes_estimated=1,922,480`
+- 新增（2026-03-09，路由层回归）：
+  - `FixedRouteLayout` 路由层已恢复 `Masstree`（`prefix -> partition_idx`）。
+  - 点路由 `FindPartitionByKey` 已回到 masstree 查询路径。
+  - 范围路由 `CollectPartitionsForRange` 已回到 masstree 范围扫描路径。
+  - 约束明确：双层结构核心不变，`layer0` 必须保持 masstree 路由结构。
+- 新增（2026-03-09，内存压缩 V1 + 10M 验证）：
+  - `SubtreePageStoreHandle` 收紧为 `32B`（去除 `page_count/record_count` 常驻字段，`page_size` 改 `uint16`）。
+  - `RoutePartition` 收紧为 `72B`（`generation` 改 `uint32`）。
+  - 10M 点查（`prefix_count=1,000,000`, `query_count=300,000`, `fast_bulk_l1`）结果：
+    - `l1_index_bytes_estimated=187,052,480`
+    - `l1_route_partition_bytes=72,000,000`
+    - `l1_route_index_estimated_bytes=64,000,000`
+    - `l1_subtree_bytes=48,000,000`
+  - 结论：较前一版有下降，但距离 `<50MB` 目标仍有明显差距，需要进入“紧凑描述符 + 共享页引用池”阶段。
 - 新增（2026-03-09，内存收敛）：
   - `RoutePartition` 已压缩（移除 `route_key`、`record_count` 改 `uint32`、`subtree_pages_cache` 改按需指针）。
   - `SubtreeStoredPageRef` 已压缩（`16B -> 8B`，`segment_id` 改 `uint32`，导入快照增加越界检查）。

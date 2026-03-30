@@ -17,10 +17,21 @@
 class DataBlockWriter
 {
 private:
+    struct PendingBlockWrite
+    {
+        off_t page_addr = -1;
+        PDataBlock block{};
+    };
+
+    static constexpr size_t kBlockBytes = sizeof(PDataBlock);
+    static constexpr size_t kWriteBatchBytes = 128 * 1024;  // 128KB
+
     SegmentAllocator *seg_allocator_;
     SortedSegment *current_segment_;
     PDataBlockWrapper blocks_buf_;
     std::vector<SortedSegment*> used_segments_;
+    std::vector<PendingBlockWrite> pending_writes_;
+    size_t pending_bytes_ = 0;
 	int num = 0;
     int fd;
 
@@ -38,5 +49,6 @@ public:
 
 private:
     virtual void allocate_block();
+    void QueueCurrentBlockWrite(off_t block_addr);
+    bool FlushPendingWrites(bool force);
 };
-

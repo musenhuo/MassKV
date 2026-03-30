@@ -55,7 +55,6 @@ public:
     bool BinarySearchWindow(uint64_t block_offset,
                             Slice key,
                             const char* value_out,
-                            int entry_num,
                             uint16_t start_entry,
                             uint16_t entry_count);
     

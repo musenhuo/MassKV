@@ -10,6 +10,7 @@ a.cpp
 .pool/
 benchmark_pools/*.log
 experiments/performance_evaluation/**/results/
+experiments/performance_evaluation/**/dbfiles/
 hmasstree.tar.gz
 docs/FlowKV_ A Parallel and IO-Friendly Key-Value Store Exploiting High-Bandwidth Solid State Drives.pdf
 High efficent key-value  store.pptx
@@ -18,3 +19,8 @@ lib/hmasstree/test_components
 lib/hmasstree/test_external_storage
 lib/hmasstree/test_l5_debug
 benchmark_pools/*.log
+.claude/
+*.pid
+leafonly*.log
+point_lookup_100m_leafonly_manual_0p10.txt
+故事稿.docx

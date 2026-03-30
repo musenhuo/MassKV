@@ -7,15 +7,56 @@ set -e
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
 
-NUM_KEYS=${1:-10000}
-CACHE_SIZE_MB=${2:-32}
+NUM_KEYS=${1:-1000000}
+CACHE_SIZE_MB=${2:-64}
 STORAGE_PATH="/tmp/hmasstree_cold_restart.dat"
+
+# Safety guards to prevent accidental OOM.
+MAX_KEYS=${COLD_RESTART_MAX_KEYS:-10000000}
+MAX_CACHE_MB=${COLD_RESTART_MAX_CACHE_MB:-1024}
+MAX_VMEM_GB=${COLD_RESTART_MAX_VMEM_GB:-64}
+TIMEOUT_SEC=${COLD_RESTART_TIMEOUT_SEC:-0}
+
+if ! [[ "${NUM_KEYS}" =~ ^[0-9]+$ ]]; then
+    echo "[ERR] NUM_KEYS must be an integer, got: ${NUM_KEYS}" >&2
+    exit 1
+fi
+if ! [[ "${CACHE_SIZE_MB}" =~ ^[0-9]+$ ]]; then
+    echo "[ERR] CACHE_SIZE_MB must be an integer, got: ${CACHE_SIZE_MB}" >&2
+    exit 1
+fi
+if ! [[ "${MAX_VMEM_GB}" =~ ^[0-9]+$ ]]; then
+    echo "[ERR] COLD_RESTART_MAX_VMEM_GB must be an integer, got: ${MAX_VMEM_GB}" >&2
+    exit 1
+fi
+
+if (( NUM_KEYS > MAX_KEYS )); then
+    echo "[WARN] NUM_KEYS=${NUM_KEYS} exceeds MAX_KEYS=${MAX_KEYS}, clamping."
+    NUM_KEYS=${MAX_KEYS}
+fi
+if (( CACHE_SIZE_MB > MAX_CACHE_MB )); then
+    echo "[WARN] CACHE_SIZE_MB=${CACHE_SIZE_MB} exceeds MAX_CACHE_MB=${MAX_CACHE_MB}, clamping."
+    CACHE_SIZE_MB=${MAX_CACHE_MB}
+fi
+
+VMEM_KB=$((MAX_VMEM_GB * 1024 * 1024))
+
+run_limited() {
+    local exe="$1"
+    shift
+    if (( TIMEOUT_SEC > 0 )); then
+        bash -lc "ulimit -v ${VMEM_KB}; timeout ${TIMEOUT_SEC} \"${exe}\" $*"
+    else
+        bash -lc "ulimit -v ${VMEM_KB}; \"${exe}\" $*"
+    fi
+}
 
 echo "============================================"
 echo "H-Masstree Cold Restart Test (v3)"
 echo "============================================"
 echo "Keys:       $NUM_KEYS"
 echo "Cache Size: $CACHE_SIZE_MB MB"
+echo "Max vmem:   $MAX_VMEM_GB GB"
 echo "Storage:    $STORAGE_PATH"
 echo ""
 
@@ -269,7 +310,7 @@ fi
 
 echo ""
 echo "=== Running Phase 1: Create & Serialize ==="
-/tmp/cold_restart_test 1 "$STORAGE_PATH" $NUM_KEYS $CACHE_SIZE_MB
+run_limited /tmp/cold_restart_test 1 "$STORAGE_PATH" "$NUM_KEYS" "$CACHE_SIZE_MB"
 
 echo ""
 echo "=== Storage file info ==="
@@ -281,7 +322,7 @@ sleep 1
 
 echo ""
 echo "=== Running Phase 2: Cold Restart & Restore ==="
-/tmp/cold_restart_test 2 "$STORAGE_PATH" $NUM_KEYS $CACHE_SIZE_MB
+run_limited /tmp/cold_restart_test 2 "$STORAGE_PATH" "$NUM_KEYS" "$CACHE_SIZE_MB"
 
 echo ""
 echo "============================================"

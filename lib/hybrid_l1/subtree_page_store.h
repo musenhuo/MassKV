@@ -4,41 +4,42 @@
 #include "db/allocator/segment_allocator.h"
 
 #include <cstdint>
-#include <limits>
 #include <vector>
 
 namespace flowkv::hybrid_l1 {
 
-constexpr uint32_t kInvalidSubtreeSegmentId = std::numeric_limits<uint32_t>::max();
-
-struct SubtreeStoredPageRef {
-    uint32_t segment_id = kInvalidSubtreeSegmentId;
-    uint32_t page_id = 0;
-};
-
 struct SubtreePageStoreHandle {
     static constexpr uint8_t kQueryMetaValid = 0x1;
 
-    uint32_t page_size = 0;
+    uint16_t page_size = 0;
     uint8_t flags = 0;
-    uint32_t root_page_id = kInvalidSubtreePageId;
+    uint8_t reserved = 0;
     uint32_t page_count = 0;
     uint64_t record_count = 0;
-    std::vector<SubtreeStoredPageRef> pages;
+    SubtreePagePtr root_page_ptr = kInvalidSubtreePagePtr;
+    SubtreePagePtr manifest_page_ptr = kInvalidSubtreePagePtr;
 
     bool Valid() const {
-        return page_size != 0 && !pages.empty();
+        if (page_size == 0) {
+            return false;
+        }
+        if (page_count == 0) {
+            return root_page_ptr == kInvalidSubtreePagePtr &&
+                   manifest_page_ptr == kInvalidSubtreePagePtr;
+        }
+        return root_page_ptr != kInvalidSubtreePagePtr &&
+               manifest_page_ptr != kInvalidSubtreePagePtr;
     }
 
     bool HasQueryMeta() const {
         return (flags & kQueryMetaValid) != 0;
     }
 
-    void SetQueryMeta(uint32_t root_id, uint32_t subtree_page_count, uint64_t subtree_record_count) {
+    void SetQueryMeta(SubtreePagePtr root_ptr, uint32_t pages, uint64_t records) {
         flags |= kQueryMetaValid;
-        root_page_id = root_id;
-        page_count = subtree_page_count;
-        record_count = subtree_record_count;
+        root_page_ptr = root_ptr;
+        page_count = pages;
+        record_count = records;
     }
 };
 
@@ -60,9 +61,20 @@ public:
                                              SubtreeCowStats* stats_out = nullptr);
     static std::vector<uint8_t> LoadManifestPage(SegmentAllocator& allocator,
                                                  const SubtreePageStoreHandle& handle);
-    static std::vector<uint8_t> LoadPageById(SegmentAllocator& allocator,
-                                             const SubtreePageStoreHandle& handle,
-                                             uint32_t page_id);
+    static std::vector<uint8_t> LoadPageByPtr(SegmentAllocator& allocator,
+                                              uint32_t page_size,
+                                              SubtreePagePtr page_ptr);
+    static std::vector<uint8_t> LoadPageByPtr(SegmentAllocator& allocator,
+                                              const SubtreePageStoreHandle& handle,
+                                              SubtreePagePtr page_ptr);
+    // Persist opaque 4KB-aligned pages (e.g., NormalPack pages) and return physical pointers.
+    static std::vector<SubtreePagePtr> PersistOpaquePages(
+        SegmentAllocator& allocator,
+        uint32_t page_size,
+        const std::vector<std::vector<uint8_t>>& pages);
+    static void DestroyOpaquePages(SegmentAllocator& allocator,
+                                   uint32_t page_size,
+                                   const std::vector<SubtreePagePtr>& page_ptrs);
     static SubtreePageSet Load(SegmentAllocator& allocator, const SubtreePageStoreHandle& handle);
     static void Destroy(SegmentAllocator& allocator, const SubtreePageStoreHandle& handle);
     static void DestroyUnshared(SegmentAllocator& allocator,

@@ -11,6 +11,7 @@ namespace flowkv::experiments {
 enum class PrefixDistribution {
     kUniform,
     kPrefixSkew,
+    kPrefixSkewExtreme,
 };
 
 struct FastBulkL1BuildOptions {

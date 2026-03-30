@@ -1,23 +1,21 @@
 #include "db.h"
 #include "config.h"
 #include <libpmem.h>
+#include <malloc.h>
 #include "allocator/segment_allocator.h"
 #include "compaction/version.h"
 #include "compaction/manifest.h"
 #include "compaction/flush.h"
 #include "compaction/compaction.h"
 #include "datablock_reader.h"
-#if defined(USE_HMASSTREE)
-#include "lib/index_hmasstree.h"
-#else
 #include "lib/index_masstree.h"
-#endif
 #include "util/stopwatch.hpp"
 #include "lib/ThreadPool/include/threadpool.h"
 #include "lib/ThreadPool/include/threadpool_imp.h"
 #ifdef HOT_MEMTABLE
 #include "lib/index_hot.h"
 #endif
+#include <algorithm>
 
 // Global Get statistics
 std::atomic<uint64_t> MYDB::global_get_success_{0};
@@ -60,11 +58,7 @@ MYDB::MYDB()
 		memtable_states_[i].state = MemTableStates::EMPTY;
 	}
 #ifdef MASSTREE_MEMTABLE
-	#if defined(USE_HMASSTREE)
-	mem_index_[current_memtable_idx_] = new HMasstreeIndex();
-	#else
 	mem_index_[current_memtable_idx_] = new MasstreeIndex();
-	#endif
 #endif
 #ifdef HOT_MEMTABLE
 	mem_index_[current_memtable_idx_] = new HOTIndex(MAX_MEMTABLE_ENTRIES * 8);
@@ -105,11 +99,11 @@ MYDB::MYDB()
 	}
 	//Thread pool init: flush threads + compaction threads + flush/compaction controller threads
 	thread_pool_ = new ThreadPoolImpl();
-	thread_pool_->SetBackgroundThreads(4);
+	thread_pool_->SetBackgroundThreads(std::max<size_t>(1, cfg.bg_trigger_threads));
 	flush_thread_pool_ = new ThreadPoolImpl();
-	flush_thread_pool_->SetBackgroundThreads(RANGE_PARTITION_NUM);
+	flush_thread_pool_->SetBackgroundThreads(std::max<size_t>(1, cfg.flush_threads));
 	compaction_thread_pool_ = new ThreadPoolImpl();
-	compaction_thread_pool_->SetBackgroundThreads(RANGE_PARTITION_NUM);
+	compaction_thread_pool_->SetBackgroundThreads(std::max<size_t>(1, cfg.compaction_threads));
 
 	// Initialize partition info
 	size_t range=(1UL<<32)/RANGE_PARTITION_NUM << 32;
@@ -155,11 +149,7 @@ MYDB::MYDB(const MYDBConfig &cfg)
 		memtable_states_[i].state = MemTableStates::EMPTY;
 	}
 #ifdef MASSTREE_MEMTABLE
-	#if defined(USE_HMASSTREE)
-	mem_index_[current_memtable_idx_] = new HMasstreeIndex();
-	#else
 	mem_index_[current_memtable_idx_] = new MasstreeIndex();
-	#endif
 #endif
 #ifdef HOT_MEMTABLE
 	mem_index_[current_memtable_idx_] = new HOTIndex(MAX_MEMTABLE_ENTRIES * 8);
@@ -197,11 +187,11 @@ MYDB::MYDB(const MYDBConfig &cfg)
 			ERROR_EXIT("recover error");
 	}
 	thread_pool_ = new ThreadPoolImpl();
-	thread_pool_->SetBackgroundThreads(4);
+	thread_pool_->SetBackgroundThreads(std::max<size_t>(1, cfg.bg_trigger_threads));
 	flush_thread_pool_ = new ThreadPoolImpl();
-	flush_thread_pool_->SetBackgroundThreads(RANGE_PARTITION_NUM);
+	flush_thread_pool_->SetBackgroundThreads(std::max<size_t>(1, cfg.flush_threads));
 	compaction_thread_pool_ = new ThreadPoolImpl();
-	compaction_thread_pool_->SetBackgroundThreads(RANGE_PARTITION_NUM);
+	compaction_thread_pool_->SetBackgroundThreads(std::max<size_t>(1, cfg.compaction_threads));
 
 	size_t range = (1UL << 32) / RANGE_PARTITION_NUM << 32;
 	for (size_t i = 0; i < RANGE_PARTITION_NUM; i++)
@@ -529,13 +519,30 @@ bool MYDB::MayTriggerFlushOrCompaction()
 	size_t flush_threashold = read_only_mode_ ? 1 : MAX_MEMTABLE_ENTRIES;
 	if (memtablesize >= flush_threashold)
 	{
-		// printf("memtablesize[%d]=%lu\n", current_memtable_idx_, memtablesize);
-		bool expect = false;
-		if (is_flushing_.compare_exchange_weak(expect, true))
-		{
-			FlushArgs *fa = new FlushArgs(this);
-			thread_pool_->Schedule(&MYDB::TriggerBGFlush, fa, fa, nullptr);
-			return true;
+		// Allow concurrent flushes as long as there are free memtable slots
+        if (flushing_count_.load() < MAX_MEMTABLE_NUM - 1)
+        {
+			// Freeze current memtable and switch to next
+			int target_memtable_idx = current_memtable_idx_;
+			int next_memtable_idx = (target_memtable_idx + 1) % MAX_MEMTABLE_NUM;
+			if (memtable_states_[next_memtable_idx].state == MemTableStates::EMPTY)
+			{
+				flushing_count_.fetch_add(1);
+				memtable_states_[target_memtable_idx].state = MemTableStates::FREEZE;
+#ifdef MASSTREE_MEMTABLE
+				mem_index_[next_memtable_idx] = new MasstreeIndex();
+#endif
+#ifdef HOT_MEMTABLE
+				mem_index_[next_memtable_idx] = new HOTIndex(MAX_MEMTABLE_ENTRIES * 8);
+#endif
+				memtable_states_[next_memtable_idx].state = MemTableStates::ACTIVE;
+				current_memtable_idx_ = next_memtable_idx;
+				LOG("switch memtable %d -> %d for parallel flush", target_memtable_idx, next_memtable_idx);
+
+				FlushArgs *fa = new FlushArgs(this, target_memtable_idx);
+				thread_pool_->Schedule(&MYDB::TriggerBGFlush, fa, fa, nullptr);
+				return true;
+			}
 		}
 	}
 	// Compaction
@@ -592,8 +599,7 @@ void MYDB::TriggerBGFlush(void *arg)
 {
 	FlushArgs fa = *(reinterpret_cast<FlushArgs *>(arg));
 	delete (reinterpret_cast<FlushArgs *>(arg));
-	// printf("trigger flush\n");
-	static_cast<MYDB *>(fa.db_)->BGFlush();
+	static_cast<MYDB *>(fa.db_)->BGFlush(fa.target_memtable_idx_);
 }
 
 void MYDB::TriggerBGCompaction(void *arg)
@@ -606,79 +612,60 @@ void MYDB::TriggerBGCompaction(void *arg)
 
 bool MYDB::BGFlush()
 {
-	if (!current_version_->CheckSpaceForL0Tree())
-	{
-		LOG("flush stall due to full L0");
-		is_flushing_ = false;
-		return false;
-	}
-	LOG("start flush active_memtable = %d, memtablesize=(%lu,%lu), level0treenum=%d,table=%d", current_memtable_idx_.load(), memtable_size_[0].load(), memtable_size_[1].load(), current_version_->GetLevel0TreeNum(), current_version_->GetLevelSize(0));
-	stopwatch_t sw;
-	sw.start();
-	// 1. freeze memtable and modify the current_memtable_idx of MYDB
 	int target_memtable_idx = current_memtable_idx_;
 	int next_memtable_idx = (target_memtable_idx + 1) % MAX_MEMTABLE_NUM;
-/* if only enabling single-thread flush, this memtable state control is not neccessary
-	LOG("start flush,target idx=%d,kv=%lu", target_memtable_idx, memtable_size_[target_memtable_idx].load());
-	if (memtable_states_[target_memtable_idx].state != MemTableStates::ACTIVE)
-	{
-		DEBUG("memtable_states_[%d].state =%d, flush failed", target_memtable_idx, memtable_states_[target_memtable_idx].state);
-		return false;
-	}
-	LOG("target memtable is active: ok!");
+	flushing_count_.fetch_add(1);
 	memtable_states_[target_memtable_idx].state = MemTableStates::FREEZE;
-	if (memtable_states_[next_memtable_idx].state != MemTableStates::EMPTY)
-		return false;
-*/
 #ifdef MASSTREE_MEMTABLE
-	#if defined(USE_HMASSTREE)
-	mem_index_[next_memtable_idx] = new HMasstreeIndex();
-	#else
 	mem_index_[next_memtable_idx] = new MasstreeIndex();
-	#endif
 #endif
 #ifdef HOT_MEMTABLE
 	mem_index_[next_memtable_idx] = new HOTIndex(MAX_MEMTABLE_ENTRIES * 8);
 #endif
 	memtable_states_[next_memtable_idx].state = MemTableStates::ACTIVE;
-	current_memtable_idx_ = next_memtable_idx; // change active memtable
-	LOG("change memtable. active_memtable = %d, memtablesize=(%lu,%lu), l0treenum=%d,table=%d", current_memtable_idx_.load(), memtable_size_[0].load(), memtable_size_[1].load(), current_version_->GetLevel0TreeNum(), current_version_->GetLevelSize(0));
-	// from this time, user thread can write into new memtable and other flush can be triggered on other memtable
-	// 2. wait all threads not busy
-	DEBUG("step 2");
-	// for (int i = 0; i < MAX_USER_THREAD_NUM; i++)
-	// {
-	//     while (memtable_states_[target_memtable_idx].thread_write_states[i] == true)
-	//     {
-	//         std::this_thread::yield();
-	//     }
-	// }
-	usleep(100); // just wait for all client put over, instead of checking client state with a shared value
+	current_memtable_idx_ = next_memtable_idx;
+	return BGFlush(target_memtable_idx);
+}
+
+bool MYDB::BGFlush(int target_memtable_idx)
+{
+    while (!current_version_->CheckSpaceForL0Tree())
+    {
+		LOG("flush waiting for L0 space, target_memtable=%d", target_memtable_idx);
+		MayTriggerCompaction();
+		usleep(1000);
+	}
+	LOG("start flush target_memtable=%d, level0treenum=%d,table=%d", target_memtable_idx, current_version_->GetLevel0TreeNum(), current_version_->GetLevelSize(0));
+	stopwatch_t sw;
+	sw.start();
+	// Memtable switch already done at trigger point.
+	// Wait for in-flight writers to finish on the target memtable.
+	for (int i = 0; i < MAX_USER_THREAD_NUM; ++i)
+	{
+		while (memtable_states_[target_memtable_idx].thread_write_states[i].load(std::memory_order_acquire))
+		{
+			std::this_thread::yield();
+		}
+	}
 	// Persist any client-local buffered log entries that still belong to the flushed memtable.
 	for (int i = 0; i < MAX_USER_THREAD_NUM; i++)
 	{
 		auto *client = client_list_[i];
-		if (client != nullptr && client->current_memtable_idx_ == target_memtable_idx)
+		if (client != nullptr)
 		{
-			client->Persist_Log();
+			client->Persist_Log(target_memtable_idx);
 		}
 	}
-	// 3. core steps
+	// Streaming flush (no temporary vector allocation)
 	DEBUG("flush step 3");
-	FlushJob fj(mem_index_[target_memtable_idx], target_memtable_idx, segment_allocator_, current_version_, manifest_, partition_info_,flush_thread_pool_);
-	auto ret = fj.subrunParallel();
-	//auto ret = fj.run();
-	// 4. change memtable state to EMPTY
+	FlushJob fj(mem_index_[target_memtable_idx], target_memtable_idx, segment_allocator_, current_version_, manifest_, partition_info_, flush_thread_pool_);
+	auto ret = fj.run();
+	// Clean up memtable
 	DEBUG("step 4");
 	memtable_states_[target_memtable_idx].state = MemTableStates::EMPTY;
-	int expect = 0;
 	DEBUG("before delete memtable");
 #ifdef MASSTREE_MEMTABLE
-	#if defined(USE_HMASSTREE)
-	delete (HMasstreeIndex *)mem_index_[target_memtable_idx];
-	#else
 	delete (MasstreeIndex *)mem_index_[target_memtable_idx];
-	#endif
 #endif
 	DEBUG("after delete memtable");
 #ifdef HOT_MEMTABLE
@@ -688,10 +675,11 @@ bool MYDB::BGFlush()
 	ClearMemtableSize(target_memtable_idx);
 	segment_allocator_->ClearLogGroup(target_memtable_idx);
 
-	// MayTriggerFlushOrCompaction(); // to trigger cascade compaction
-	is_flushing_ = false;
+	flushing_count_.fetch_sub(1);
+	// Return freed Masstree pool memory to OS
+	malloc_trim(0);
 	auto ms = sw.elapsed<std::chrono::milliseconds>();
-	LOG("finish flush active_memtable = %d, memtablesize=(%lu,%lu), level0treenum=%d,table=%d,time=%f ms", current_memtable_idx_, GetMemtableSize(0), GetMemtableSize(1), current_version_->GetLevel0TreeNum(), current_version_->GetLevelSize(0), ms);
+	LOG("finish flush target_memtable=%d, level0treenum=%d,table=%d,time=%f ms", target_memtable_idx, current_version_->GetLevel0TreeNum(), current_version_->GetLevelSize(0), ms);
 	INFO("flush end, time=%f ms", ms);
 	return true;
 }
@@ -758,7 +746,7 @@ void MYDB::WaitForFlushAndCompaction()
 {
 	EnableReadOptimizedMode();
 	EnableReadOnlyMode();
-	while (is_flushing_.load() || is_l0_compacting_.load())
+	while (flushing_count_.load() > 0 || is_l0_compacting_.load())
 	{
 		sleep(1);
 	}

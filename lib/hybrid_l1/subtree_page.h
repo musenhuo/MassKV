@@ -3,11 +3,14 @@
 #include "subtree_bptree.h"
 
 #include <cstdint>
+#include <limits>
 #include <vector>
 
 namespace flowkv::hybrid_l1 {
 
 constexpr uint32_t kInvalidSubtreePageId = 0xFFFFFFFFu;
+using SubtreePagePtr = uint64_t;
+constexpr SubtreePagePtr kInvalidSubtreePagePtr = std::numeric_limits<SubtreePagePtr>::max();
 
 enum class SubtreePageType : uint16_t {
     kInternal = 1,
@@ -30,16 +33,16 @@ struct SubtreePage {
 };
 
 struct SubtreeDecodedLeafPage {
-    KeyType high_key{};
-    uint32_t prev_page_id = kInvalidSubtreePageId;
-    uint32_t next_page_id = kInvalidSubtreePageId;
+    RouteSuffix high_key = 0;
+    SubtreePagePtr prev_page_ptr = kInvalidSubtreePagePtr;
+    SubtreePagePtr next_page_ptr = kInvalidSubtreePagePtr;
     std::vector<SubtreeRecord> records;
 };
 
 struct SubtreeDecodedInternalPage {
-    KeyType high_key{};
-    std::vector<uint32_t> child_page_ids;
-    std::vector<KeyType> child_high_keys;
+    RouteSuffix high_key = 0;
+    std::vector<SubtreePagePtr> child_page_ptrs;
+    std::vector<RouteSuffix> child_high_keys;
 };
 
 struct SubtreePageSet {

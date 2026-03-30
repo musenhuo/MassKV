@@ -10,8 +10,8 @@
 #define MAX_MEMTABLE_NUM 4
 
 /// 单个 memtable 预计可容纳的 entries 上限（策略阈值；具体使用方式由实现决定）。
-/// 临时降低为 50万 以便触发 flush。原值为 40000000
-#define MAX_MEMTABLE_ENTRIES 500000
+/// 使用 4000万 entries（memtable_40m）配置。
+#define MAX_MEMTABLE_ENTRIES 40000000
 
 /// L0 层 tree 数量上限（仅上限；触发由 db->l0_compaction_tree_num_ 控制）。
 #define MAX_L0_TREE_NUM 32 //only a upper limit. trigger is db->l0_compaction_tree_num_
@@ -31,11 +31,8 @@
 
 /// H-Masstree（Masstree 的修改版副本）切换开关。
 ///
-/// 该开关由 CMake 选项控制：
-/// - 原 Masstree：`cmake -S . -B build && cmake --build build -j`
-/// - H-Masstree： `cmake -S . -B build -DUSE_HMASSTREE=ON && cmake --build build -j`
+/// 构建命令：`cmake -S . -B build && cmake --build build -j`
 ///
-/// @note 不建议在此处手动 `#define USE_HMASSTREE`，因为还需要链接对应的 hmasstree 静态库。
 
 
 // Now defined in CMakeList.txt
@@ -75,4 +72,7 @@ public:
     size_t pm_pool_size = 500ul << 30;          ///< 持久化内存池大小（字节）。
     bool recover = false;                       ///< 打开时是否执行恢复流程（由实现决定）。
     bool use_direct_io = false;                 ///< 是否使用 O_DIRECT 绕过页缓存。
+    size_t bg_trigger_threads = 4;              ///< 后台触发线程池大小。
+    size_t flush_threads = RANGE_PARTITION_NUM; ///< flush 并行线程数。
+    size_t compaction_threads = 4;              ///< compaction 并行线程数。
 };

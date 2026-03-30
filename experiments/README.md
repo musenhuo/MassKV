@@ -19,6 +19,6 @@
 - 先完成 `correctness_regression/`
 - 再完成 `performance_evaluation/01_point_lookup`
 - 再完成 `performance_evaluation/02_range_query`
-- 再完成 `performance_evaluation/03_compaction_update`
+- 再完成 `performance_evaluation/03_compaction_update`（online write performance）
 - 然后补 `04_space_overhead`、`05_recovery_runtime`、`06_long_running_mixed`
 - 最后完成 `ablation_studies/`

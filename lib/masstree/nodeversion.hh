@@ -76,6 +76,12 @@ class nodeversion {
     bool is_root() const {
         return v_ & P::root_bit;
     }
+    bool cold() const {
+        return v_ & P::cold_bit;
+    }
+    void mark_cold() {
+        v_ |= P::cold_bit;
+    }
     bool has_split(nodeversion<P> x) const {
         fence();
         return (x.v_ ^ v_) >= P::vsplit_lowbit;
@@ -332,12 +338,12 @@ template <> struct nodeversion_parameters<uint32_t> {
         dirty_mask = inserting_bit | splitting_bit,
         vinsert_lowbit = (1U << 3), // == inserting_bit << 2
         vsplit_lowbit = (1U << 9),
-        unused1_bit = (1U << 28),
+        cold_bit = (1U << 28),
         deleted_bit = (1U << 29),
         root_bit = (1U << 30),
         isleaf_bit = (1U << 31),
-        split_unlock_mask = ~(root_bit | unused1_bit | (vsplit_lowbit - 1)),
-        unlock_mask = ~(unused1_bit | (vinsert_lowbit - 1)),
+        split_unlock_mask = ~(root_bit | cold_bit | (vsplit_lowbit - 1)),
+        unlock_mask = ~(cold_bit | (vinsert_lowbit - 1)),
         top_stable_bits = 4
     };
 
@@ -353,12 +359,12 @@ template <> struct nodeversion_parameters<uint64_t> {
         dirty_mask = inserting_bit | splitting_bit,
         vinsert_lowbit = (1ULL << 11), // == inserting_bit << 2
         vsplit_lowbit = (1ULL << 27),
-        unused1_bit = (1ULL << 60),
+        cold_bit = (1ULL << 60),
         deleted_bit = (1ULL << 61),
         root_bit = (1ULL << 62),
         isleaf_bit = (1ULL << 63),
-        split_unlock_mask = ~(root_bit | unused1_bit | (vsplit_lowbit - 1)),
-        unlock_mask = ~(unused1_bit | (vinsert_lowbit - 1)),
+        split_unlock_mask = ~(root_bit | cold_bit | (vsplit_lowbit - 1)),
+        unlock_mask = ~(cold_bit | (vinsert_lowbit - 1)),
         top_stable_bits = 4
     };
 

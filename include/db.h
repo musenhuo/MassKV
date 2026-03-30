@@ -11,6 +11,7 @@
 #include <array>
 #include <memory>
 #include <thread>
+#include <mutex>
 #include "slice.h"
 #include "db_common.h"
 #include "log_format.h"
@@ -37,7 +38,7 @@ struct MemTableStates
     } state = EMPTY;
 
     /// 该 memtable 的按用户线程维度写入状态标记。
-    bool thread_write_states[MAX_USER_THREAD_NUM];
+    std::atomic_bool thread_write_states[MAX_USER_THREAD_NUM];
 };
 
 /**
@@ -83,8 +84,9 @@ private:
     bool compaction_enabled_ = true;
     bool use_direct_io_ = false;      ///< 是否对 PST 读取使用 O_DIRECT
     size_t l0_compaction_tree_num_ = 4;
+    size_t l0_write_stall_tree_num_ = MAX_L0_TREE_NUM - 1;
 
-    std::atomic<bool> is_flushing_ = false;
+    std::atomic<int> flushing_count_{0};
     std::atomic<bool> is_l0_compacting_ = false;
 
     int workload_detect_sample_ = 0;
@@ -183,8 +185,9 @@ public: // TODO: change to private
      * @return 若触发了 compaction 任务则返回 true。
      */
     bool MayTriggerCompaction();
-
-    /** @brief 执行一次后台 flush 周期。 */
+    /** @brief 执行一次后台 flush 周期（指定 memtable）。 */
+    bool BGFlush(int target_memtable_idx);
+    /** @brief 手动触发 flush：切换 memtable 并 flush 当前的。 */
     bool BGFlush();
 
     /** @brief 执行一次后台 compaction 周期。 */
@@ -235,7 +238,8 @@ public: // TODO: change to private
     struct FlushArgs
     {
         MYDB *db_;
-        FlushArgs(MYDB *db) : db_(db) {}
+        int target_memtable_idx_;
+        FlushArgs(MYDB *db, int idx) : db_(db), target_memtable_idx_(idx) {}
     };
 
     /**
@@ -309,6 +313,18 @@ public: // TODO: change to private
         l0_compaction_tree_num_ = num;
     }
 
+    /** @brief 设置 L0 写阻塞阈值（达到后前台写等待后台 compaction 降低 L0 树数）。 */
+    void SetL0WriteStallTreeNum(size_t num)
+    {
+        if (num == 0)
+        {
+            l0_write_stall_tree_num_ = 1;
+            return;
+        }
+        const size_t hard_max = MAX_L0_TREE_NUM - 1;
+        l0_write_stall_tree_num_ = (num < hard_max) ? num : hard_max;
+    }
+
     /** @brief 启用/禁用后台 compaction。 */
     void SetCompactionEnabled(bool enabled)
     {
@@ -371,6 +387,7 @@ public:
      * @brief 持久化该 client 的日志状态（由实现决定）。
      */
     void Persist_Log();
+    bool Persist_Log(int memtable_idx);
 
     /// 该 client 绑定的逻辑线程 id。
     const int thread_id_;
@@ -391,6 +408,7 @@ private:
     size_t put_num_in_current_memtable_[MAX_MEMTABLE_NUM];
     std::atomic_uint64_t total_writes_ = 0;
     std::atomic_uint64_t total_reads_ = 0;
+    std::mutex log_writer_mu_;
 
     /**
         * @brief 尝试从 memtable 满足一次读取。

@@ -13,7 +13,7 @@ namespace {
 
 constexpr uint32_t kManifestMagic = 0x48314D4Cu;  // "LM1H"
 constexpr uint32_t kPageMagic = 0x5042544Cu;      // "LTBP"
-constexpr uint16_t kFormatVersion = 2;
+constexpr uint16_t kFormatVersion = 3;
 constexpr size_t kPageHeaderSize = 20;
 
 using Node = L1SubtreeBPTree::Node;
@@ -28,17 +28,21 @@ size_t EncodedKeySize() {
 #endif
 }
 
+size_t EncodedSuffixSize() {
+    return sizeof(RouteSuffix);
+}
+
 size_t EncodedRecordSize() {
     return EncodedKeySize() * 2 + sizeof(uint64_t) * 3 + sizeof(uint32_t) + sizeof(uint64_t) +
            sizeof(uint64_t);
 }
 
 size_t EncodedLeafPayloadSize(size_t record_count) {
-    return EncodedKeySize() + sizeof(uint32_t) * 2 + record_count * EncodedRecordSize();
+    return EncodedSuffixSize() + sizeof(uint64_t) * 2 + record_count * EncodedRecordSize();
 }
 
 size_t EncodedInternalPayloadSize(size_t child_count) {
-    return EncodedKeySize() + child_count * (sizeof(uint32_t) + EncodedKeySize());
+    return EncodedSuffixSize() + child_count * (sizeof(uint64_t) + EncodedSuffixSize());
 }
 
 void EnsureSize(const std::vector<uint8_t>& bytes, size_t offset, size_t need, const char* what) {
@@ -106,6 +110,14 @@ KeyType ReadKey(const std::vector<uint8_t>& in, size_t offset) {
 #else
     return ReadU64(in, offset);
 #endif
+}
+
+void WriteSuffix(std::vector<uint8_t>& out, size_t offset, RouteSuffix suffix) {
+    WriteU64(out, offset, suffix);
+}
+
+RouteSuffix ReadSuffix(const std::vector<uint8_t>& in, size_t offset) {
+    return ReadU64(in, offset);
 }
 
 void EncodeRecord(std::vector<uint8_t>& out, size_t offset, const SubtreeRecord& record) {
@@ -232,21 +244,21 @@ SubtreePageManifest ParseManifestBytes(const std::vector<uint8_t>& manifest_byte
 }
 
 struct DecodedLeafPage {
-    KeyType high_key{};
-    uint32_t prev_page_id = kInvalidSubtreePageId;
-    uint32_t next_page_id = kInvalidSubtreePageId;
+    RouteSuffix high_key = 0;
+    SubtreePagePtr prev_page_ptr = kInvalidSubtreePagePtr;
+    SubtreePagePtr next_page_ptr = kInvalidSubtreePagePtr;
     std::vector<SubtreeRecord> records;
 };
 
 DecodedLeafPage DecodeLeafPage(const std::vector<uint8_t>& bytes, const DecodedPageHeader& header) {
     DecodedLeafPage page;
     size_t offset = kPageHeaderSize;
-    page.high_key = ReadKey(bytes, offset);
-    offset += EncodedKeySize();
-    page.prev_page_id = ReadU32(bytes, offset);
-    offset += sizeof(uint32_t);
-    page.next_page_id = ReadU32(bytes, offset);
-    offset += sizeof(uint32_t);
+    page.high_key = ReadSuffix(bytes, offset);
+    offset += EncodedSuffixSize();
+    page.prev_page_ptr = ReadU64(bytes, offset);
+    offset += sizeof(uint64_t);
+    page.next_page_ptr = ReadU64(bytes, offset);
+    offset += sizeof(uint64_t);
     page.records.reserve(header.item_count);
     for (uint32_t i = 0; i < header.item_count; ++i) {
         page.records.push_back(DecodeRecord(bytes, offset));
@@ -259,24 +271,24 @@ DecodedLeafPage DecodeLeafPage(const std::vector<uint8_t>& bytes, const DecodedP
 }
 
 struct DecodedInternalPage {
-    KeyType high_key{};
-    std::vector<uint32_t> child_page_ids;
-    std::vector<KeyType> child_high_keys;
+    RouteSuffix high_key = 0;
+    std::vector<SubtreePagePtr> child_page_ptrs;
+    std::vector<RouteSuffix> child_high_keys;
 };
 
 DecodedInternalPage DecodeInternalPage(const std::vector<uint8_t>& bytes,
                                        const DecodedPageHeader& header) {
     DecodedInternalPage page;
     size_t offset = kPageHeaderSize;
-    page.high_key = ReadKey(bytes, offset);
-    offset += EncodedKeySize();
-    page.child_page_ids.reserve(header.item_count);
+    page.high_key = ReadSuffix(bytes, offset);
+    offset += EncodedSuffixSize();
+    page.child_page_ptrs.reserve(header.item_count);
     page.child_high_keys.reserve(header.item_count);
     for (uint32_t i = 0; i < header.item_count; ++i) {
-        page.child_page_ids.push_back(ReadU32(bytes, offset));
-        offset += sizeof(uint32_t);
-        page.child_high_keys.push_back(ReadKey(bytes, offset));
-        offset += EncodedKeySize();
+        page.child_page_ptrs.push_back(ReadU64(bytes, offset));
+        offset += sizeof(uint64_t);
+        page.child_high_keys.push_back(ReadSuffix(bytes, offset));
+        offset += EncodedSuffixSize();
     }
     if (offset != kPageHeaderSize + header.payload_bytes) {
         throw std::runtime_error("internal page payload size mismatch");
@@ -300,7 +312,7 @@ void CollectNodesPreOrder(const Node* node,
 }  // namespace
 
 SubtreePageSet SubtreePageCodec::Export(const L1SubtreeBPTree& tree, uint32_t page_size) {
-    if (page_size < kPageHeaderSize + EncodedKeySize() + sizeof(uint32_t) * 2) {
+    if (page_size < kPageHeaderSize + EncodedSuffixSize() + sizeof(uint32_t) * 2) {
         throw std::invalid_argument("subtree page size too small");
     }
 
@@ -339,23 +351,23 @@ SubtreePageSet SubtreePageCodec::Export(const L1SubtreeBPTree& tree, uint32_t pa
                              static_cast<uint32_t>(payload_bytes));
 
             size_t offset = kPageHeaderSize;
-            WriteKey(page.bytes, offset, leaf->high_key);
-            offset += EncodedKeySize();
+            WriteSuffix(page.bytes, offset, leaf->high_key);
+            offset += EncodedSuffixSize();
             const auto leaf_pos_it = tree.leaf_positions_.find(leaf);
             if (leaf_pos_it == tree.leaf_positions_.end()) {
                 throw std::runtime_error("leaf missing position during page export");
             }
             const size_t leaf_index = leaf_pos_it->second;
-            WriteU32(page.bytes, offset,
+            WriteU64(page.bytes, offset,
                      leaf_index > 0
-                         ? page_ids.at(tree.leaves_[leaf_index - 1].get())
-                         : kInvalidSubtreePageId);
-            offset += sizeof(uint32_t);
-            WriteU32(page.bytes, offset,
+                         ? static_cast<uint64_t>(page_ids.at(tree.leaves_[leaf_index - 1].get()))
+                         : kInvalidSubtreePagePtr);
+            offset += sizeof(uint64_t);
+            WriteU64(page.bytes, offset,
                      leaf_index + 1 < tree.leaves_.size()
-                         ? page_ids.at(tree.leaves_[leaf_index + 1].get())
-                         : kInvalidSubtreePageId);
-            offset += sizeof(uint32_t);
+                         ? static_cast<uint64_t>(page_ids.at(tree.leaves_[leaf_index + 1].get()))
+                         : kInvalidSubtreePagePtr);
+            offset += sizeof(uint64_t);
             for (const auto& record : leaf->records) {
                 EncodeRecord(page.bytes, offset, record);
                 offset += EncodedRecordSize();
@@ -372,13 +384,13 @@ SubtreePageSet SubtreePageCodec::Export(const L1SubtreeBPTree& tree, uint32_t pa
                              static_cast<uint32_t>(payload_bytes));
 
             size_t offset = kPageHeaderSize;
-            WriteKey(page.bytes, offset, internal->high_key);
-            offset += EncodedKeySize();
+            WriteSuffix(page.bytes, offset, internal->high_key);
+            offset += EncodedSuffixSize();
             for (size_t i = 0; i < internal->children.size(); ++i) {
-                WriteU32(page.bytes, offset, page_ids.at(internal->children[i].get()));
-                offset += sizeof(uint32_t);
-                WriteKey(page.bytes, offset, internal->high_keys[i]);
-                offset += EncodedKeySize();
+                WriteU64(page.bytes, offset, page_ids.at(internal->children[i].get()));
+                offset += sizeof(uint64_t);
+                WriteSuffix(page.bytes, offset, internal->high_keys[i]);
+                offset += EncodedSuffixSize();
             }
         }
 
@@ -425,7 +437,7 @@ void SubtreePageCodec::Import(const SubtreePageSet& page_set, L1SubtreeBPTree& t
             continue;
         }
         const DecodedLeafPage leaf = DecodeLeafPage(page.bytes, header);
-        if (leaf.prev_page_id == kInvalidSubtreePageId) {
+        if (leaf.prev_page_ptr == kInvalidSubtreePagePtr) {
             leftmost_leaf = page.page_id;
             break;
         }
@@ -436,11 +448,8 @@ void SubtreePageCodec::Import(const SubtreePageSet& page_set, L1SubtreeBPTree& t
     }
 
     std::unordered_set<uint32_t> visited;
-    for (uint32_t current = leftmost_leaf;
-         current != kInvalidSubtreePageId;
-         current = DecodeLeafPage(page_map.at(current)->bytes,
-                                  DecodePageHeader(page_map.at(current)->bytes))
-                       .next_page_id) {
+    uint32_t current = leftmost_leaf;
+    while (current != kInvalidSubtreePageId) {
         if (!visited.insert(current).second) {
             throw std::runtime_error("loop detected in subtree leaf chain");
         }
@@ -454,6 +463,13 @@ void SubtreePageCodec::Import(const SubtreePageSet& page_set, L1SubtreeBPTree& t
         }
         const DecodedLeafPage leaf = DecodeLeafPage(it->second->bytes, header);
         records.insert(records.end(), leaf.records.begin(), leaf.records.end());
+        if (leaf.next_page_ptr == kInvalidSubtreePagePtr) {
+            current = kInvalidSubtreePageId;
+        } else if (leaf.next_page_ptr <= std::numeric_limits<uint32_t>::max()) {
+            current = static_cast<uint32_t>(leaf.next_page_ptr);
+        } else {
+            throw std::runtime_error("leaf chain points to invalid logical page id");
+        }
     }
 
     if (records.size() != manifest.record_count) {
@@ -521,18 +537,23 @@ bool SubtreePageCodec::Validate(const SubtreePageSet& page_set) {
             } else {
                 ++seen_internal_pages;
                 const DecodedInternalPage internal = DecodeInternalPage(it->second->bytes, header);
-                if (internal.child_page_ids.size() != header.item_count ||
+                if (internal.child_page_ptrs.size() != header.item_count ||
                     internal.child_high_keys.size() != header.item_count) {
                     return false;
                 }
-                for (size_t i = 0; i < internal.child_page_ids.size(); ++i) {
-                    if (page_map.find(internal.child_page_ids[i]) == page_map.end()) {
+                for (size_t i = 0; i < internal.child_page_ptrs.size(); ++i) {
+                    if (internal.child_page_ptrs[i] == kInvalidSubtreePagePtr ||
+                        internal.child_page_ptrs[i] > std::numeric_limits<uint32_t>::max()) {
                         return false;
                     }
-                    if (CompareKeyType(internal.child_high_keys[i], internal.high_key) > 0) {
+                    const uint32_t child_page_id = static_cast<uint32_t>(internal.child_page_ptrs[i]);
+                    if (page_map.find(child_page_id) == page_map.end()) {
                         return false;
                     }
-                    stack.push_back(internal.child_page_ids[i]);
+                    if (internal.child_high_keys[i] > internal.high_key) {
+                        return false;
+                    }
+                    stack.push_back(child_page_id);
                 }
             }
         }
@@ -556,10 +577,10 @@ bool SubtreePageCodec::Validate(const SubtreePageSet& page_set) {
             if (leaf.records.empty()) {
                 return false;
             }
-            if (CompareKeyType(leaf.records.back().RouteMaxKey(), leaf.high_key) != 0) {
+            if (leaf.records.back().route_max_suffix != leaf.high_key) {
                 return false;
             }
-            if (leaf.prev_page_id == kInvalidSubtreePageId) {
+            if (leaf.prev_page_ptr == kInvalidSubtreePagePtr) {
                 leftmost_candidates.push_back(page.page_id);
             }
         }
@@ -585,14 +606,18 @@ bool SubtreePageCodec::Validate(const SubtreePageSet& page_set) {
                 return false;
             }
             const DecodedLeafPage leaf = DecodeLeafPage(it->second->bytes, header);
-            if (leaf.next_page_id != kInvalidSubtreePageId) {
-                const auto next_it = page_map.find(leaf.next_page_id);
+            if (leaf.next_page_ptr != kInvalidSubtreePagePtr) {
+                if (leaf.next_page_ptr > std::numeric_limits<uint32_t>::max()) {
+                    return false;
+                }
+                const uint32_t next_page_id = static_cast<uint32_t>(leaf.next_page_ptr);
+                const auto next_it = page_map.find(next_page_id);
                 if (next_it == page_map.end()) {
                     return false;
                 }
                 const DecodedLeafPage next_leaf = DecodeLeafPage(
                     next_it->second->bytes, DecodePageHeader(next_it->second->bytes));
-                if (next_leaf.prev_page_id != current) {
+                if (next_leaf.prev_page_ptr != current) {
                     return false;
                 }
             }
@@ -610,7 +635,13 @@ bool SubtreePageCodec::Validate(const SubtreePageSet& page_set) {
                 first_record = false;
                 ++chain_records;
             }
-            current = leaf.next_page_id;
+            if (leaf.next_page_ptr == kInvalidSubtreePagePtr) {
+                current = kInvalidSubtreePageId;
+            } else if (leaf.next_page_ptr <= std::numeric_limits<uint32_t>::max()) {
+                current = static_cast<uint32_t>(leaf.next_page_ptr);
+            } else {
+                return false;
+            }
         }
 
         return leaf_chain_visited.size() == manifest.leaf_page_count &&
@@ -633,8 +664,8 @@ bool SubtreePageCodec::TryDecodeLeafPage(const std::vector<uint8_t>& bytes,
         }
         const DecodedLeafPage decoded = DecodeLeafPage(bytes, header);
         out.high_key = decoded.high_key;
-        out.prev_page_id = decoded.prev_page_id;
-        out.next_page_id = decoded.next_page_id;
+        out.prev_page_ptr = decoded.prev_page_ptr;
+        out.next_page_ptr = decoded.next_page_ptr;
         out.records = decoded.records;
         return true;
     } catch (const std::exception&) {
@@ -651,7 +682,7 @@ bool SubtreePageCodec::TryDecodeInternalPage(const std::vector<uint8_t>& bytes,
         }
         const DecodedInternalPage decoded = DecodeInternalPage(bytes, header);
         out.high_key = decoded.high_key;
-        out.child_page_ids = decoded.child_page_ids;
+        out.child_page_ptrs = decoded.child_page_ptrs;
         out.child_high_keys = decoded.child_high_keys;
         return true;
     } catch (const std::exception&) {

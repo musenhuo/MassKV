@@ -13,12 +13,15 @@
 #include "db/pst_reader.h"
 #include "db/pst_builder.h"
 #include "db/pst_deleter.h"
+#include "lib/hybrid_l1/l1_delta_batch.h"
 #include "lib/hybrid_l1/l1_hybrid_index.h"
 
 #include <algorithm>
 #include <queue>
 #include <map>
+#include <unordered_map>
 #include <atomic>
+#include <mutex>
 
 struct TreeMeta
 {
@@ -50,6 +53,8 @@ private:
     int l0_tail_ = 0;
     int l0_head_ = 0;
     int l0_read_tail_ = 0;
+    bool l0_tree_ready_[MAX_L0_TREE_NUM]{};
+    mutable std::mutex l0_meta_lock_;
 
     TreeMeta level0_tree_meta_[MAX_L0_TREE_NUM];
     // TODO: recover it when recovering db
@@ -57,14 +62,25 @@ private:
     int l1_seq_ = 0;
 
     // level1
-    std::vector<TaggedPstMeta> level1_tables_;
+    std::unordered_map<uint64_t, TaggedPstMeta> level1_table_by_block_;
     flowkv::hybrid_l1::L1HybridIndex *level1_tree_;
-    std::vector<size_t> level1_free_list_;
     PSTReader pst_reader_;
+    int l1_batch_update_depth_ = 0;
+    std::vector<KeyType> pending_l1_changed_route_keys_;
+    bool has_pending_l1_delta_batch_ = false;
+    flowkv::hybrid_l1::L1DeltaBatch pending_l1_delta_batch_;
 
     void RebuildLevel1Tree();
     void RebuildLevel1Partitions(const std::vector<KeyType>& changed_route_keys);
+    void RebuildLevel1Partitions(const std::vector<KeyType>& changed_route_keys,
+                                 const flowkv::hybrid_l1::L1DeltaBatch* delta_batch);
     std::vector<KeyType> CollectChangedRouteKeysForTable(const PSTMeta& table) const;
+    void RebuildLevel1TableMapFromRecords();
+    void CollectActiveLevel1Tables(std::vector<TaggedPstMeta>& output) const;
+    bool ResolveL1BlockToTableMeta(uint64_t kv_block_ptr, TaggedPstMeta& output) const;
+    bool ResolveL1RecordToTableMeta(const flowkv::hybrid_l1::SubtreeRecord& record,
+                                    TaggedPstMeta& output) const;
+    void QueueOrApplyL1Rebuild(const std::vector<KeyType>& changed_route_keys);
 
 public:
     Version(SegmentAllocator *seg_allocator);
@@ -72,8 +88,14 @@ public:
 
     int InsertTableToL0(TaggedPstMeta table, int tree_idx);
     int InsertTableToL1(TaggedPstMeta table);
-    void RecoverLevel1Tables(std::vector<TaggedPstMeta> tables, uint32_t next_l1_seq);
+    void BeginRecoverLevel1(uint32_t next_l1_seq, size_t expected_table_count = 0);
+    void RecoverLevel1Table(const TaggedPstMeta& table);
+    void FinalizeRecoverLevel1();
+    void RecoverLevel1Tables(const std::vector<TaggedPstMeta>& tables, uint32_t next_l1_seq);
     bool DeleteTableInL1(PSTMeta table);
+    void BeginL1BatchUpdate();
+    void EndL1BatchUpdate();
+    void SetPendingL1DeltaBatch(flowkv::hybrid_l1::L1DeltaBatch batch);
     // bool DeleteTable(int idx, int level_id);
 
     bool Get(Slice key, const char *value_out, int *value_size, PSTReader *pst_reader);
@@ -81,7 +103,7 @@ public:
     int GetLevelSize(int level)
     {
         if (level == 1)
-            return level1_tables_.size() - level1_free_list_.size();
+            return static_cast<int>(level1_table_by_block_.size());
         int count = 0;
         if (level == 0)
         {
@@ -99,12 +121,13 @@ public:
      * @return int tree idx (determined by l0_tail_)
      */
     bool CheckSpaceForL0Tree();
-    int AddLevel0Tree();
+    int AddLevel0Tree(uint32_t *seq_no_out = nullptr);
     uint32_t GetCurrentL0TreeSeq();
     void SetCurrentL0TreeSeq(uint32_t seq);
     void SetCurrentL1Seq(uint32_t seq);
     uint32_t GenerateL1Seq();
     bool FreeLevel0Tree();
+    void PublishLevel0Tree(int tree_idx);
     void UpdateLevel0ReadTail();
     int GetLevel0TreeNum()
     {
@@ -112,6 +135,14 @@ public:
     };
     int PickLevel0Trees(std::vector<std::vector<TaggedPstMeta>> &outputs, std::vector<TreeMeta> &tree_metas, int max_size = MAX_L0_TREE_NUM);
     bool PickOverlappedL1Tables(const KeyType &min, const KeyType &max, std::vector<TaggedPstMeta> &output);
+    bool PickOverlappedL1Records(const KeyType &min,
+                                 const KeyType &max,
+                                 std::vector<flowkv::hybrid_l1::SubtreeRecord> &records,
+                                 std::vector<uint64_t> &unique_kv_block_ptrs) const;
+    void ResolveL1RecordsToTables(const std::vector<flowkv::hybrid_l1::SubtreeRecord> &records,
+                                  std::vector<TaggedPstMeta> &output) const;
+    void ResolveL1BlocksToTables(const std::vector<uint64_t>& kv_block_ptrs,
+                                 std::vector<TaggedPstMeta>& output) const;
 
     bool L1TreeConsistencyCheckAndFix(PSTDeleter* pst_deleter,Manifest* manifest);
 

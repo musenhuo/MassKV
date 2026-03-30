@@ -106,7 +106,9 @@ void DataBlockReader::TraverseDataBlock(uint64_t offset, std::vector<std::pair<K
         last_key = block.entries[i].key;
         if (results)
         {
-            results->emplace_back(block.entries[i].key, block.entries[i].value);
+            results->emplace_back(
+                block.entries[i].key,
+                FixedValue16{block.entries[i].value, 0});
         }
     }
 #endif
@@ -121,7 +123,6 @@ bool DataBlockReader::BinarySearch(uint64_t offset, Slice key, const char *value
         offset,
         key,
         value_out,
-        entry_num,
         0,
         static_cast<uint16_t>(std::min<int>(entry_num, std::numeric_limits<uint16_t>::max())));
 }
@@ -129,7 +130,6 @@ bool DataBlockReader::BinarySearch(uint64_t offset, Slice key, const char *value
 bool DataBlockReader::BinarySearchWindow(uint64_t block_offset,
                                          Slice key,
                                          const char *value_out,
-                                         int entry_num,
                                          uint16_t start_entry,
                                          uint16_t entry_count)
 {
@@ -138,22 +138,21 @@ bool DataBlockReader::BinarySearchWindow(uint64_t block_offset,
         return false;
     }
 
-    if (entry_num <= 0) {
+    if (start_entry >= static_cast<uint16_t>(PDataBlock::MAX_ENTRIES)) {
         return false;
     }
-    if (start_entry >= static_cast<uint16_t>(entry_num)) {
+    if (entry_count == 0) {
+        return false;
+    }
+    const uint16_t capped_end = static_cast<uint16_t>(std::min<uint32_t>(
+        static_cast<uint32_t>(PDataBlock::MAX_ENTRIES),
+        static_cast<uint32_t>(start_entry) + static_cast<uint32_t>(entry_count)));
+    if (capped_end <= start_entry) {
         return false;
     }
     const int left_boundary = static_cast<int>(start_entry);
-    const int max_span = entry_num - left_boundary;
-    const int bounded_span = entry_count == 0
-                                 ? max_span
-                                 : std::min<int>(max_span, static_cast<int>(entry_count));
-    if (bounded_span <= 0) {
-        return false;
-    }
     int left = left_boundary;
-    int right = left_boundary + bounded_span - 1;
+    int right = static_cast<int>(capped_end) - 1;
 
 #if defined(FLOWKV_KEY16)
     // 16B key mode: each entry is 32 bytes (key_hi: 8B, key_lo: 8B, value: 16B)

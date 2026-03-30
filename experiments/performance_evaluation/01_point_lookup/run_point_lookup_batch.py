@@ -6,6 +6,7 @@ import datetime as dt
 import json
 import os
 import pathlib
+import signal
 import shutil
 import subprocess
 import sys
@@ -31,8 +32,14 @@ ALLOWED_KEYS = {
     "avg_io_pst_reads_top1pct_latency",
     "rss_bytes",
     "l1_index_bytes_estimated",
+    "l1_index_bytes_measured",
     "l1_route_partition_bytes",
     "l1_route_index_estimated_bytes",
+    "l1_route_index_measured_bytes",
+    "l1_route_hot_root_index_measured_bytes",
+    "l1_route_hot_descriptor_index_measured_bytes",
+    "l1_route_cold_stub_count",
+    "l1_route_cold_ssd_bytes",
     "l1_subtree_bytes",
     "l1_subtree_cache_bytes",
     "l1_governance_bytes",
@@ -71,6 +78,23 @@ def parse_kv_output(text: str) -> dict:
     return result
 
 
+def auto_swap_threshold(key_count: int) -> int:
+    """Returns FLOWKV_L1_ROUTE_HOT_LEAF_BUDGET_BYTES in bytes. 0 = disabled (all hot)."""
+    if key_count <= 1_000_000:
+        return 0
+    if key_count <= 10_000_000:
+        return 32 * 1024 * 1024
+    if key_count <= 100_000_000:
+        return 64 * 1024 * 1024
+    if key_count <= 1_000_000_000:
+        return 512 * 1024 * 1024
+    if key_count <= 10_000_000_000:
+        return 2 * 1024 * 1024 * 1024
+    if key_count <= 100_000_000_000:
+        return 8 * 1024 * 1024 * 1024
+    return 32 * 1024 * 1024 * 1024
+
+
 def as_number(value: str):
     try:
         if any(ch in value for ch in ".eE"):
@@ -78,6 +102,17 @@ def as_number(value: str):
         return int(value)
     except ValueError:
         return value
+
+
+def cleanup_db_dir(db_dir: pathlib.Path, keep_db_files: int) -> None:
+    if keep_db_files != 0:
+        return
+    try:
+        if db_dir.exists():
+            shutil.rmtree(db_dir, ignore_errors=True)
+    except Exception:
+        # Best-effort cleanup for large failed runs.
+        pass
 
 
 def main() -> int:
@@ -103,14 +138,16 @@ def main() -> int:
     parser.add_argument("--bitmap-persist-every", type=int, default=1024)
     parser.add_argument("--pst-nowait-poll", type=int, default=0)
     parser.add_argument("--keep-db-files", type=int, default=0)
+    parser.add_argument("--cleanup-failed-db", type=int, default=1)
     parser.add_argument("--run-id", default="")
+    parser.add_argument("--skip-report", type=int, default=0)
     args = parser.parse_args()
 
     benchmark = pathlib.Path(args.build_dir) / "experiments" / "performance_evaluation" / "01_point_lookup" / "point_lookup_benchmark"
     if not benchmark.exists():
         raise SystemExit(f"benchmark not found: {benchmark}")
 
-    timestamp = dt.datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+    timestamp = dt.datetime.now(dt.UTC).strftime("%Y%m%d_%H%M%S")
     run_id = args.run_id if args.run_id else timestamp
     run_dir = pathlib.Path(args.results_root) / run_id
     if run_dir.exists():
@@ -122,11 +159,36 @@ def main() -> int:
     plot_dir.mkdir(parents=True, exist_ok=True)
     pathlib.Path(args.db_root).mkdir(parents=True, exist_ok=True)
 
+    state = {
+        "child": None,
+        "db_dir": None,
+    }
+
+    def handle_termination(signum, _frame):
+        child = state["child"]
+        db_dir = state["db_dir"]
+        if child is not None and child.poll() is None:
+            try:
+                child.terminate()
+                child.wait(timeout=10)
+            except Exception:
+                try:
+                    child.kill()
+                except Exception:
+                    pass
+        if db_dir is not None:
+            cleanup_db_dir(db_dir, args.keep_db_files)
+        raise SystemExit(128 + signum)
+
+    signal.signal(signal.SIGTERM, handle_termination)
+    signal.signal(signal.SIGINT, handle_termination)
+
     ratios = [float(item) for item in args.prefix_ratios.split(",") if item]
     rows = []
     for ratio in ratios:
         prefix_count = max(1, int(args.key_count * ratio))
-        db_dir = pathlib.Path(args.db_root) / f"{timestamp}_{args.variant}_{args.distribution}_{args.key_count}_{prefix_count}_{args.threads}t"
+        db_dir = pathlib.Path(args.db_root) / f"{run_id}_{args.variant}_{args.distribution}_{args.key_count}_{prefix_count}_{args.threads}t"
+        cleanup_db_dir(db_dir, args.keep_db_files)
         db_dir.mkdir(parents=True, exist_ok=True)
         cmd = [
             str(benchmark),
@@ -151,20 +213,43 @@ def main() -> int:
             f"--keep-db-files={args.keep_db_files}",
         ]
         try:
-            completed = subprocess.run(cmd, check=True, capture_output=True, text=True)
+            state["db_dir"] = db_dir
+            env = os.environ.copy()
+            threshold = auto_swap_threshold(args.key_count)
+            if threshold > 0:
+                env["FLOWKV_L1_ROUTE_HOT_LEAF_BUDGET_BYTES"] = str(threshold)
+            child = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=env)
+            state["child"] = child
+            stdout, stderr = child.communicate()
+            returncode = child.returncode
+            state["child"] = None
+            if returncode != 0:
+                raise subprocess.CalledProcessError(returncode, cmd, output=stdout, stderr=stderr)
+            completed_stdout = stdout
         except subprocess.CalledProcessError as exc:
             fail_path = raw_dir / f"point_lookup_{args.key_count}_{prefix_count}_{args.distribution}_{args.threads}t.failed.txt"
             fail_path.write_text(
                 "CMD:\n" + " ".join(cmd) + "\n\nSTDOUT:\n" + (exc.stdout or "") + "\n\nSTDERR:\n" + (exc.stderr or "")
             )
+            if args.cleanup_failed_db == 1:
+                cleanup_db_dir(db_dir, args.keep_db_files)
             raise SystemExit(
                 f"benchmark failed for prefix_count={prefix_count}, see {fail_path}"
             ) from exc
+        except Exception:
+            if args.cleanup_failed_db == 1:
+                cleanup_db_dir(db_dir, args.keep_db_files)
+            raise
+        finally:
+            state["child"] = None
+            state["db_dir"] = None
+
         raw_path = raw_dir / f"point_lookup_{args.key_count}_{prefix_count}_{args.distribution}_{args.threads}t.txt"
-        raw_path.write_text(completed.stdout)
-        parsed = {k: as_number(v) for k, v in parse_kv_output(completed.stdout).items()}
+        raw_path.write_text(completed_stdout)
+        parsed = {k: as_number(v) for k, v in parse_kv_output(completed_stdout).items()}
         parsed["prefix_ratio"] = ratio
         rows.append(parsed)
+        cleanup_db_dir(db_dir, args.keep_db_files)
 
     csv_path = run_dir / "results.csv"
     if rows:
@@ -196,8 +281,25 @@ def main() -> int:
         "bitmap_persist_every": args.bitmap_persist_every,
         "pst_nowait_poll": args.pst_nowait_poll,
         "keep_db_files": args.keep_db_files,
+        "cleanup_failed_db": args.cleanup_failed_db,
     }
     (run_dir / "meta.json").write_text(json.dumps(meta, indent=2))
+
+    if args.skip_report != 1:
+        report_script = pathlib.Path(__file__).resolve().parent / "generate_point_lookup_report.py"
+        if not report_script.exists():
+            raise SystemExit(f"report script not found: {report_script}")
+        subprocess.run(
+            [
+                sys.executable,
+                str(report_script),
+                "--results-dir",
+                str(run_dir),
+                "--results-root",
+                str(pathlib.Path(args.results_root).resolve()),
+            ],
+            check=True,
+        )
 
     print(run_dir)
     return 0
