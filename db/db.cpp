@@ -16,10 +16,52 @@
 #include "lib/index_hot.h"
 #endif
 #include <algorithm>
+#include <atomic>
+#include <chrono>
+#include <cstdlib>
+#include <fstream>
+#include <iostream>
+#include <string>
 
 // Global Get statistics
 std::atomic<uint64_t> MYDB::global_get_success_{0};
 std::atomic<uint64_t> MYDB::global_get_failure_{0};
+
+namespace {
+
+std::atomic<uint64_t> g_compaction_trace_invocation_id{0};
+std::atomic<uint64_t> g_flush_trace_invocation_id{0};
+
+bool CompactionTraceEnabled() {
+	const char* raw = std::getenv("FLOWKV_COMPACTION_TRACE");
+	return raw != nullptr && raw[0] != '\0' && raw[0] != '0';
+}
+
+bool FlushTraceEnabled() {
+	const char* raw = std::getenv("FLOWKV_FLUSH_TRACE");
+	return raw != nullptr && raw[0] != '\0' && raw[0] != '0';
+}
+
+uint64_t ReadProcessRSSBytesFromProc() {
+	std::ifstream status("/proc/self/status");
+	if (!status.is_open()) {
+		return 0;
+	}
+	std::string key;
+	while (status >> key) {
+		if (key == "VmRSS:") {
+			uint64_t kb = 0;
+			std::string unit;
+			status >> kb >> unit;
+			return kb * 1024ULL;
+		}
+		std::string rest;
+		std::getline(status, rest);
+	}
+	return 0;
+}
+
+} // namespace
 
 /***********************MYDB*************************/
 
@@ -293,7 +335,10 @@ MYDB::~MYDB()
 	WaitForFlushAndCompaction();
 	// segment_allocator_->PrintLogStats();
 	stop_bgwork_ = true;
-	thread_pool_->JoinAllThreads();
+	if (thread_pool_ != nullptr)
+	{
+		thread_pool_->JoinAllThreads();
+	}
 	PrintLogGroup(0);
 	PrintLogGroup(1);
 	if (bgwork_trigger_)
@@ -320,8 +365,11 @@ MYDB::~MYDB()
 	delete current_version_;
 	delete segment_allocator_;
 	delete manifest_;
-	delete thread_pool_;
-	thread_pool_ = nullptr;
+	if (thread_pool_ != nullptr)
+	{
+		delete thread_pool_;
+		thread_pool_ = nullptr;
+	}
 	for (int i = 0; i < MAX_MEMTABLE_NUM; i++)
 	{
 		if (memtable_states_[i].state != MemTableStates::EMPTY && mem_index_[i] != nullptr)
@@ -629,6 +677,33 @@ bool MYDB::BGFlush()
 
 bool MYDB::BGFlush(int target_memtable_idx)
 {
+	const bool trace_enabled = FlushTraceEnabled();
+	const uint64_t trace_invocation_id =
+		g_flush_trace_invocation_id.fetch_add(1, std::memory_order_relaxed) + 1;
+	const auto trace_begin = std::chrono::steady_clock::now();
+	const auto emit_flush_trace = [&](const char* stage, double phase_time_ms) {
+		if (!trace_enabled) {
+			return;
+		}
+		const auto now = std::chrono::steady_clock::now();
+		const double elapsed_ms =
+			static_cast<double>(
+				std::chrono::duration_cast<std::chrono::microseconds>(now - trace_begin).count()) /
+			1000.0;
+		const uint64_t rss_bytes = ReadProcessRSSBytesFromProc();
+		std::cout << "[FLUSH_TRACE]"
+		          << " invocation_id=" << trace_invocation_id
+		          << " stage=" << stage
+		          << " elapsed_ms=" << elapsed_ms
+		          << " phase_time_ms=" << phase_time_ms
+		          << " rss_bytes=" << rss_bytes
+		          << " target_memtable=" << target_memtable_idx
+		          << " current_memtable=" << current_memtable_idx_
+		          << " l0_tree_num=" << current_version_->GetLevel0TreeNum()
+		          << " l1_active_pst_count=" << current_version_->GetLevelSize(1)
+		          << "\n";
+	};
+	emit_flush_trace("entry", 0.0);
     while (!current_version_->CheckSpaceForL0Tree())
     {
 		LOG("flush waiting for L0 space, target_memtable=%d", target_memtable_idx);
@@ -640,6 +715,7 @@ bool MYDB::BGFlush(int target_memtable_idx)
 	sw.start();
 	// Memtable switch already done at trigger point.
 	// Wait for in-flight writers to finish on the target memtable.
+	auto phase_begin = std::chrono::steady_clock::now();
 	for (int i = 0; i < MAX_USER_THREAD_NUM; ++i)
 	{
 		while (memtable_states_[target_memtable_idx].thread_write_states[i].load(std::memory_order_acquire))
@@ -647,7 +723,14 @@ bool MYDB::BGFlush(int target_memtable_idx)
 			std::this_thread::yield();
 		}
 	}
+	auto phase_end = std::chrono::steady_clock::now();
+	emit_flush_trace(
+		"wait_writers_end",
+		static_cast<double>(
+			std::chrono::duration_cast<std::chrono::microseconds>(phase_end - phase_begin).count()) /
+			1000.0);
 	// Persist any client-local buffered log entries that still belong to the flushed memtable.
+	phase_begin = std::chrono::steady_clock::now();
 	for (int i = 0; i < MAX_USER_THREAD_NUM; i++)
 	{
 		auto *client = client_list_[i];
@@ -656,12 +739,26 @@ bool MYDB::BGFlush(int target_memtable_idx)
 			client->Persist_Log(target_memtable_idx);
 		}
 	}
+	phase_end = std::chrono::steady_clock::now();
+	emit_flush_trace(
+		"persist_logs_end",
+		static_cast<double>(
+			std::chrono::duration_cast<std::chrono::microseconds>(phase_end - phase_begin).count()) /
+			1000.0);
 	// Streaming flush (no temporary vector allocation)
 	DEBUG("flush step 3");
 	FlushJob fj(mem_index_[target_memtable_idx], target_memtable_idx, segment_allocator_, current_version_, manifest_, partition_info_, flush_thread_pool_);
+	phase_begin = std::chrono::steady_clock::now();
 	auto ret = fj.run();
+	phase_end = std::chrono::steady_clock::now();
+	emit_flush_trace(
+		"flush_job_end",
+		static_cast<double>(
+			std::chrono::duration_cast<std::chrono::microseconds>(phase_end - phase_begin).count()) /
+			1000.0);
 	// Clean up memtable
 	DEBUG("step 4");
+	phase_begin = std::chrono::steady_clock::now();
 	memtable_states_[target_memtable_idx].state = MemTableStates::EMPTY;
 	DEBUG("before delete memtable");
 #ifdef MASSTREE_MEMTABLE
@@ -673,70 +770,154 @@ bool MYDB::BGFlush(int target_memtable_idx)
 #endif
 	mem_index_[target_memtable_idx] = nullptr;
 	ClearMemtableSize(target_memtable_idx);
+	phase_end = std::chrono::steady_clock::now();
+	emit_flush_trace(
+		"cleanup_memtable_end",
+		static_cast<double>(
+			std::chrono::duration_cast<std::chrono::microseconds>(phase_end - phase_begin).count()) /
+			1000.0);
+	phase_begin = std::chrono::steady_clock::now();
 	segment_allocator_->ClearLogGroup(target_memtable_idx);
+	phase_end = std::chrono::steady_clock::now();
+	emit_flush_trace(
+		"clear_log_group_end",
+		static_cast<double>(
+			std::chrono::duration_cast<std::chrono::microseconds>(phase_end - phase_begin).count()) /
+			1000.0);
 
 	flushing_count_.fetch_sub(1);
 	// Return freed Masstree pool memory to OS
+	phase_begin = std::chrono::steady_clock::now();
 	malloc_trim(0);
+	phase_end = std::chrono::steady_clock::now();
+	emit_flush_trace(
+		"malloc_trim_end",
+		static_cast<double>(
+			std::chrono::duration_cast<std::chrono::microseconds>(phase_end - phase_begin).count()) /
+			1000.0);
 	auto ms = sw.elapsed<std::chrono::milliseconds>();
 	LOG("finish flush target_memtable=%d, level0treenum=%d,table=%d,time=%f ms", target_memtable_idx, current_version_->GetLevel0TreeNum(), current_version_->GetLevelSize(0), ms);
 	INFO("flush end, time=%f ms", ms);
+	emit_flush_trace("exit", ms);
 	return true;
 }
 
 bool MYDB::BGCompaction()
 {
+	const bool trace_enabled = CompactionTraceEnabled();
+	const uint64_t trace_invocation_id =
+		g_compaction_trace_invocation_id.fetch_add(1, std::memory_order_relaxed) + 1;
+	const auto trace_begin = std::chrono::steady_clock::now();
+	const auto emit_compaction_trace = [&](const char* stage,
+	                                       double phase_time_ms,
+	                                       int picked_inputs,
+	                                       int ok_flag) {
+		if (!trace_enabled) {
+			return;
+		}
+		const auto now = std::chrono::steady_clock::now();
+		const double elapsed_ms =
+			static_cast<double>(
+				std::chrono::duration_cast<std::chrono::microseconds>(now - trace_begin).count()) /
+			1000.0;
+		const uint64_t rss_bytes = ReadProcessRSSBytesFromProc();
+		std::cout << "[COMPACTION_TRACE]"
+		          << " invocation_id=" << trace_invocation_id
+		          << " stage=" << stage
+		          << " elapsed_ms=" << elapsed_ms
+		          << " phase_time_ms=" << phase_time_ms
+		          << " rss_bytes=" << rss_bytes
+		          << " l0_tree_num=" << current_version_->GetLevel0TreeNum()
+		          << " l1_active_pst_count=" << current_version_->GetLevelSize(1);
+		if (picked_inputs >= 0) {
+			std::cout << " picked_inputs=" << picked_inputs;
+		}
+		if (ok_flag >= 0) {
+			std::cout << " ok=" << ok_flag;
+		}
+		std::cout << "\n";
+	};
+
+	emit_compaction_trace("entry", 0.0, -1, -1);
 	CompactionJob *c = new CompactionJob(segment_allocator_, current_version_, manifest_, partition_info_,compaction_thread_pool_);
 	// 1 PickCompaction (lock, freeze pst range)
 	stopwatch_t sw;
 	sw.start();
+	emit_compaction_trace("pick_start", 0.0, -1, -1);
 	LOG("PickCompaction start");
 	auto num = c->PickCompaction();
 	auto ms = sw.elapsed<std::chrono::milliseconds>();
 	auto total_ms = ms;
 	LOG("PickCompaction end, time: %f ms", ms);
+	emit_compaction_trace("pick_end", ms, static_cast<int>(num), 1);
 	if (num == 0)
 	{
 		is_l0_compacting_ = false;
+		emit_compaction_trace("exit_no_input", total_ms, 0, 0);
 		return false;
 	}
 	// 2 Prepare
+	emit_compaction_trace("prepare_start", 0.0, static_cast<int>(num), -1);
+	sw.clear();
+	sw.start();
 	auto ret = c->CheckPmRoomEnough();
+	ms = sw.elapsed<std::chrono::milliseconds>();
+	total_ms += ms;
+	emit_compaction_trace("prepare_end", ms, static_cast<int>(num), ret ? 1 : 0);
 	if (!ret)
 	{
 		is_l0_compacting_ = false;
+		emit_compaction_trace("exit_no_room", total_ms, static_cast<int>(num), 0);
 		return false;
 	}
 	// 3 Merge sorting
 	LOG("RunCompaction start");
 	sw.clear();
 	sw.start();
-	ret = c->RunSubCompactionParallel();
+	emit_compaction_trace("run_start", 0.0, static_cast<int>(num), -1);
+	const bool use_serial_compaction = c->ShouldUseSerialCompaction();
+	ret = use_serial_compaction ? c->RunCompaction() : c->RunSubCompactionParallel();
 	ms = sw.elapsed<std::chrono::milliseconds>();
 	LOG("RunCompaction end, time: %f ms", ms);
 	total_ms += ms;
+	emit_compaction_trace("run_end", ms, static_cast<int>(num), ret ? 1 : 0);
 	// exit(-1);
 	if (!ret)
 	{
+		emit_compaction_trace("rollback_start", 0.0, static_cast<int>(num), -1);
+		sw.clear();
+		sw.start();
 		c->RollbackCompaction();
+		ms = sw.elapsed<std::chrono::milliseconds>();
+		total_ms += ms;
+		emit_compaction_trace("rollback_end", ms, static_cast<int>(num), 1);
 		is_l0_compacting_ = false;
+		emit_compaction_trace("exit_run_fail", total_ms, static_cast<int>(num), 0);
 		return false;
 	}
 	// 4 delete obsolute psts and change level0 indexes
 	LOG("CleanCompaction start");
 	sw.clear();
 	sw.start();
-	// c->CleanCompaction();
-	c->CleanCompactionWhenUsingSubCompaction();
+	emit_compaction_trace("clean_start", 0.0, static_cast<int>(num), -1);
+	if (use_serial_compaction) {
+		c->CleanCompaction();
+	} else {
+		c->CleanCompactionWhenUsingSubCompaction();
+	}
 	ms = sw.elapsed<std::chrono::milliseconds>();
 	LOG("CleanCompaction end, time: %f ms", ms);
 	total_ms += ms;
+	emit_compaction_trace("clean_end", ms, static_cast<int>(num), 1);
 	is_l0_compacting_ = false;
 	LOG("before compaction end");
 	print_dram_consuption();
+	emit_compaction_trace("before_delete_job", 0.0, static_cast<int>(num), -1);
 	delete c;
+	emit_compaction_trace("after_delete_job", 0.0, static_cast<int>(num), 1);
 	print_dram_consuption();
 	INFO("compaction end, time=%f ms", total_ms);
+	emit_compaction_trace("exit_success", total_ms, static_cast<int>(num), 1);
 	MayTriggerFlushOrCompaction();
 
 	return true;
@@ -803,4 +984,202 @@ void MYDB::PrintL1IndexStats()
 	if (current_version_) {
 		current_version_->PrintL1IndexStats();
 	}
+}
+
+MYDB::EngineResidentMemoryStats MYDB::DebugEstimateEngineResidentMemory() const
+{
+    EngineResidentMemoryStats stats;
+
+    if (current_version_ != nullptr) {
+        const auto l1_memory = current_version_->DebugEstimateLevel1MemoryUsage();
+        const auto l1_resident = current_version_->DebugEstimateLevel1ResidentMemory();
+        const auto l0_list_memory = current_version_->DebugEstimateLevel0ListMemory();
+        const auto l0_tree_index_memory = current_version_->DebugEstimateLevel0TreeIndexMemory();
+
+        stats.l1_route_index_estimated_bytes = l1_memory.route_index_estimated_bytes;
+        stats.l1_route_index_measured_bytes = l1_memory.route_index_measured_bytes;
+        stats.l1_route_index_pool_bytes = l1_memory.route_index_pool_bytes;
+        stats.l1_route_partition_bytes = l1_memory.route_partition_bytes;
+        stats.l1_subtree_published_bytes = l1_memory.subtree_bytes;
+        stats.l1_subtree_cache_bytes = l1_memory.subtree_cache_bytes;
+        stats.l1_pending_changed_route_keys_bytes = l1_resident.pending_changed_route_keys_bytes;
+        stats.l1_pending_delta_estimated_bytes = l1_resident.pending_delta_estimated_bytes;
+        stats.l0_table_lists_total_size = l0_list_memory.total_size;
+        stats.l0_table_lists_total_capacity = l0_list_memory.total_capacity;
+        stats.l0_table_lists_total_capacity_bytes = l0_list_memory.total_capacity_bytes;
+        stats.l0_tree_index_count = l0_tree_index_memory.tree_count;
+        stats.l0_tree_index_tree_bytes = l0_tree_index_memory.tree_bytes;
+        stats.l0_tree_index_pool_bytes = l0_tree_index_memory.tree_pool_bytes;
+        stats.l0_tree_index_total_bytes = l0_tree_index_memory.total_bytes;
+
+        const uint64_t route_index_bytes =
+            l1_memory.route_index_measured_bytes != 0
+                ? static_cast<uint64_t>(l1_memory.route_index_measured_bytes)
+                : static_cast<uint64_t>(l1_memory.route_index_estimated_bytes);
+        stats.l1_total_estimated_bytes =
+            route_index_bytes +
+            static_cast<uint64_t>(l1_memory.route_partition_bytes) +
+            static_cast<uint64_t>(l1_memory.subtree_bytes) +
+            static_cast<uint64_t>(l1_memory.subtree_cache_bytes) +
+            static_cast<uint64_t>(l1_resident.pending_changed_route_keys_bytes) +
+            static_cast<uint64_t>(l1_resident.pending_delta_estimated_bytes);
+    }
+
+    if (segment_allocator_ != nullptr) {
+        const auto seg_stats = segment_allocator_->DebugEstimateResidentMemory();
+        stats.seg_bitmap_bytes = seg_stats.segment_bitmap_bytes;
+        stats.seg_bitmap_history_bytes = seg_stats.segment_bitmap_history_bytes;
+        stats.seg_bitmap_freed_bits_capacity_bytes =
+            seg_stats.segment_bitmap_freed_bits_capacity_bytes;
+        stats.seg_log_bitmap_bytes = seg_stats.log_segment_bitmap_bytes;
+        stats.seg_log_bitmap_history_bytes = seg_stats.log_segment_bitmap_history_bytes;
+        stats.seg_log_bitmap_freed_bits_capacity_bytes =
+            seg_stats.log_segment_bitmap_freed_bits_capacity_bytes;
+        stats.seg_cache_count = seg_stats.data_segment_cache_count;
+        stats.seg_cache_queue_estimated_bytes = seg_stats.data_segment_cache_queue_estimated_bytes;
+        stats.seg_cache_segment_object_bytes =
+            seg_stats.data_segment_cache_segment_object_bytes;
+        stats.seg_cache_segment_buffer_bytes =
+            seg_stats.data_segment_cache_segment_buffer_bytes;
+        stats.seg_cache_segment_bitmap_bytes =
+            seg_stats.data_segment_cache_segment_bitmap_bytes;
+        stats.seg_cache_segment_bitmap_freed_bits_capacity_bytes =
+            seg_stats.data_segment_cache_segment_bitmap_freed_bits_capacity_bytes;
+        stats.seg_log_group_slot_bytes = seg_stats.log_segment_group_slot_bytes;
+        stats.seg_total_estimated_bytes = seg_stats.total_estimated_bytes;
+    }
+
+    if (manifest_ != nullptr) {
+        const auto manifest_stats = manifest_->DebugEstimateResidentMemory();
+        stats.manifest_super_buffer_bytes =
+            manifest_stats.aligned_super_page_buffer_bytes;
+        stats.manifest_super_meta_bytes = manifest_stats.super_meta_bytes;
+        stats.manifest_batch_super_meta_bytes = manifest_stats.batch_super_meta_bytes;
+        stats.manifest_l0_freelist_estimated_bytes =
+            manifest_stats.l0_freelist_estimated_bytes;
+        stats.manifest_batch_pages_count = manifest_stats.batch_pages_count;
+        stats.manifest_batch_pages_data_bytes = manifest_stats.batch_pages_data_bytes;
+        stats.manifest_batch_pages_map_node_estimated_bytes =
+            manifest_stats.batch_pages_map_node_estimated_bytes;
+        stats.manifest_batch_pages_map_bucket_bytes =
+            manifest_stats.batch_pages_map_bucket_bytes;
+        stats.manifest_total_estimated_bytes = manifest_stats.total_estimated_bytes;
+    }
+
+#ifdef MASSTREE_MEMTABLE
+    for (int i = 0; i < MAX_MEMTABLE_NUM; ++i) {
+        auto* masstree_index = dynamic_cast<MasstreeIndex*>(mem_index_[i]);
+        if (masstree_index == nullptr) {
+            continue;
+        }
+        ++stats.memtable_masstree_active_count;
+        stats.memtable_masstree_tree_bytes +=
+            static_cast<uint64_t>(masstree_index->DebugEstimateTreeBytes());
+        stats.memtable_masstree_pool_bytes +=
+            static_cast<uint64_t>(masstree_index->DebugEstimateThreadPoolBytes());
+        stats.memtable_masstree_total_bytes +=
+            static_cast<uint64_t>(masstree_index->DebugEstimateTotalBytes());
+    }
+#endif
+
+    stats.db_core_fixed_estimated_bytes =
+        sizeof(MYDB) +
+        sizeof(mem_index_) +
+        sizeof(memtable_states_) +
+        sizeof(temp_memtable_size_) +
+        sizeof(partition_info_) +
+        sizeof(client_list_);
+
+        stats.total_known_resident_estimated_bytes =
+        stats.l1_total_estimated_bytes +
+        stats.l0_tree_index_total_bytes +
+        stats.seg_total_estimated_bytes +
+        stats.manifest_total_estimated_bytes +
+        stats.db_core_fixed_estimated_bytes;
+    return stats;
+}
+
+size_t MYDB::DebugReleaseLevel0TableListCapacityForProbe()
+{
+    if (current_version_ == nullptr) {
+        return 0;
+    }
+    return current_version_->DebugReleaseLevel0TableListCapacityForProbe();
+}
+
+size_t MYDB::DebugReleaseSegmentCacheForProbe()
+{
+    if (segment_allocator_ == nullptr) {
+        return 0;
+    }
+    return segment_allocator_->DebugReleaseDataSegmentCacheForProbe();
+}
+
+size_t MYDB::DebugReleaseAllLevel1ForProbe()
+{
+    if (current_version_ == nullptr) {
+        return 0;
+    }
+    return current_version_->DebugReleaseAllLevel1ForProbe();
+}
+
+size_t MYDB::DebugReleaseManifestStateForProbe()
+{
+    if (manifest_ == nullptr) {
+        return 0;
+    }
+    return manifest_->DebugReleaseVolatileStateForProbe();
+}
+
+size_t MYDB::DebugReleaseActiveMemtableForProbe()
+{
+    const int active_idx = current_memtable_idx_;
+    if (active_idx < 0 || active_idx >= MAX_MEMTABLE_NUM) {
+        return 0;
+    }
+    if (mem_index_[active_idx] == nullptr) {
+        return 0;
+    }
+
+    size_t released_estimated_bytes = 0;
+#ifdef MASSTREE_MEMTABLE
+    if (auto* masstree_index = dynamic_cast<MasstreeIndex*>(mem_index_[active_idx]);
+        masstree_index != nullptr) {
+        released_estimated_bytes = masstree_index->DebugEstimateTotalBytes();
+    }
+    delete static_cast<MasstreeIndex*>(mem_index_[active_idx]);
+    mem_index_[active_idx] = new MasstreeIndex();
+#else
+#ifdef HOT_MEMTABLE
+    delete static_cast<HOTIndex*>(mem_index_[active_idx]);
+    mem_index_[active_idx] = new HOTIndex(MAX_MEMTABLE_ENTRIES * 8);
+#endif
+#endif
+    ClearMemtableSize(active_idx);
+    return released_estimated_bytes;
+}
+
+size_t MYDB::DebugReleaseThreadPoolsForProbe()
+{
+    size_t released_estimated_bytes = 0;
+
+    if (flush_thread_pool_ != nullptr) {
+        flush_thread_pool_->JoinAllThreads();
+        released_estimated_bytes += sizeof(*flush_thread_pool_);
+        delete flush_thread_pool_;
+        flush_thread_pool_ = nullptr;
+    }
+    if (compaction_thread_pool_ != nullptr) {
+        compaction_thread_pool_->JoinAllThreads();
+        released_estimated_bytes += sizeof(*compaction_thread_pool_);
+        delete compaction_thread_pool_;
+        compaction_thread_pool_ = nullptr;
+    }
+    if (thread_pool_ != nullptr) {
+        thread_pool_->JoinAllThreads();
+        released_estimated_bytes += sizeof(*thread_pool_);
+        delete thread_pool_;
+        thread_pool_ = nullptr;
+    }
+    return released_estimated_bytes;
 }

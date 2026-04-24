@@ -105,15 +105,17 @@
 
 - `run_phase2_acceptance.sh`
   - 作用：
-    - 构建并运行 Phase 2 关键测试（`version_l1_selection_test`、`db_l1_*`、`manifest_*`）。
+    - 构建并运行 Phase 2 关键测试（`version_l1_selection_test`、`db_l1_*`、`manifest_*`、durable crash tests）。
     - 采集每项测试的峰值 RSS（`/usr/bin/time`）。
-    - 校验默认路径关键日志：`tableless recovery`、`record-only`、是否触发回退。
+    - 校验默认路径关键日志：`tableless recovery`、`record-only`、是否触发 direct table materialization fallback。
     - 输出汇总：
       - `summary.csv`
       - `PHASE2_ACCEPTANCE.md`
       - `logs/` 与 `time/`
   - 用法：
     - `./experiments/performance_evaluation/03_compaction_update/run_phase2_acceptance.sh`
+    - 默认复用当前仓库的 `build/`
     - 可选传入 build 目录：`./.../run_phase2_acceptance.sh build_phase2_record_only`
+    - 若传入目录的 `CMakeCache.txt` 属于其他源码树，脚本会直接失败，避免误跑到别的仓库
   - 可选开关：
-    - `FLOWKV_PHASE2_ACCEPTANCE_RUN_BENCH=1`：追加小规模 `write_online_benchmark` 双模式对比（phase2_default vs legacy_fallback）。
+    - `FLOWKV_PHASE2_ACCEPTANCE_RUN_BENCH=1`：追加小规模 `write_online_benchmark` 双模式对比（phase2_default vs records_disabled）。

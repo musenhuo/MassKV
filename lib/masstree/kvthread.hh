@@ -112,6 +112,12 @@ class threadinfo {
     static threadinfo* make(int purpose, int index);
     // XXX destructor
     static void free_ti(threadinfo* ti);
+    size_t debug_allocated_pool_bytes() const {
+        return allocated_pool_bytes_;
+    }
+    size_t debug_allocated_pool_count() const {
+        return allocated_pool_count_;
+    }
     // thread information
     int purpose() const {
         return purpose_;
@@ -323,6 +329,8 @@ class threadinfo {
     enum { pool_max_nlines = 20 };
     void* pool_[pool_max_nlines];
     std::vector<void*> allocated_pools_;
+    size_t allocated_pool_bytes_ = 0;
+    size_t allocated_pool_count_ = 0;
 
     limbo_group* limbo_head_;
     limbo_group* limbo_tail_;

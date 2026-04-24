@@ -75,6 +75,21 @@ public:
         mt_->for_each_range(start, end, std::move(callback));
     }
 
+    size_t DebugEstimateTreeBytes() const
+    {
+        return mt_ != nullptr ? mt_->EstimateMemoryUsageBytes() : 0;
+    }
+
+    size_t DebugEstimateThreadPoolBytes() const
+    {
+        return mt_ != nullptr ? mt_->EstimateThreadInfoPoolBytes() : 0;
+    }
+
+    size_t DebugEstimateTotalBytes() const
+    {
+        return DebugEstimateTreeBytes() + DebugEstimateThreadPoolBytes();
+    }
+
 private:
     MasstreeWrapper *mt_;
 

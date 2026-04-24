@@ -1,4 +1,5 @@
 #pragma once
+#include <limits>
 #include "db_common.h"
 /**
  * @brief Contains the addresses of Indexblock and some metadata
@@ -47,9 +48,9 @@ struct PSTMeta
 struct TaggedPstMeta
 {
     PSTMeta meta;
-    // optional information. maybe lost after recovery
-    size_t level;
-    size_t manifest_position;
+    // Optional metadata used by L0 manifest bookkeeping; L1 tableless mode leaves it invalid.
+    size_t level = 0;
+    size_t manifest_position = std::numeric_limits<size_t>::max();
     bool Valid() const
     {
         return meta.Valid();

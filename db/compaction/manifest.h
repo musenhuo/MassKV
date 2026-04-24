@@ -21,7 +21,12 @@
 #define L1MetaSize 512000000
 // Each log group can cotain MAX_USER_THREAD_NUM * 8 log segments, which have an 4-byte id
 #define FlushLogSize (4 * MAX_MEMTABLE_NUM * MAX_USER_THREAD_NUM * 32)
-#define L1HybridStateSize (64 * 1024 * 1024)
+// Tableless recovery persists the whole Hybrid-L1 snapshot into a double-buffered
+// manifest region. With 2M prefixes, the exported snapshot can exceed the old
+// 32MiB per-slot budget (64MiB total / 2 slots). Increase the area so the
+// breakdown matrix can cover the historical 2M-prefix settings without hitting
+// an artificial persist-size ceiling.
+#define L1HybridStateSize (512 * 1024 * 1024)
 // Quick fix for large-scale write experiments:
 // one compaction batch may touch too many manifest pages and overflow the
 // txn payload area; enlarge txn log region from 64MB to 256MB.
@@ -66,7 +71,6 @@ private:
     off_t  manifest_txn_start_;
     off_t end_;
     std::queue<int> l0_freelist_;
-    std::queue<int> l1_freelist_;
     ManifestSuperMeta super_;
     char *buf_;
     bool batch_active_ = false;
@@ -74,9 +78,25 @@ private:
     ManifestSuperMeta batch_super_;
     std::unordered_map<off_t, BatchPage> batch_pages_;
     mutable std::recursive_mutex manifest_mu_;
-    bool track_l1_tables_ = true;
 
 public:
+    struct ResidentMemoryStats
+    {
+        size_t aligned_super_page_buffer_bytes = 0;
+        size_t super_meta_bytes = 0;
+        size_t batch_super_meta_bytes = 0;
+
+        size_t l0_freelist_size = 0;
+        size_t l0_freelist_estimated_bytes = 0;
+
+        size_t batch_pages_count = 0;
+        size_t batch_pages_data_bytes = 0;
+        size_t batch_pages_map_node_estimated_bytes = 0;
+        size_t batch_pages_map_bucket_bytes = 0;
+
+        size_t total_estimated_bytes = 0;
+    };
+
     Manifest(int fd, bool recover);
     ~Manifest();
     /**
@@ -115,7 +135,8 @@ public:
     Version *RecoverVersion(Version *source,SegmentAllocator* allocator);
 
     void PrintL1Info();
-    bool IsL1TableTrackingEnabled() const { return track_l1_tables_; }
+    ResidentMemoryStats DebugEstimateResidentMemory() const;
+    size_t DebugReleaseVolatileStateForProbe();
 
 private:
     inline const off_t Getoff(int idx, int level);

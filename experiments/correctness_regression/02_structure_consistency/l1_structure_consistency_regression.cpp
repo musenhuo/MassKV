@@ -140,9 +140,16 @@ void ValidateL1Structure(MYDB& db, const std::string& stage) {
               stage + ": exported fragment must touch its route prefix");
         seen_prefixes.insert(record.route_prefix);
 
+        std::vector<SubtreeRecord> overlap_records;
+        std::vector<uint64_t> overlap_blocks;
         std::vector<TaggedPstMeta> overlaps;
-        Check(version->PickOverlappedL1Tables(record.min_key, record.max_key, overlaps),
-              stage + ": PickOverlappedL1Tables should succeed");
+        Check(version->PickOverlappedL1Records(record.min_key, record.max_key, overlap_records, overlap_blocks),
+              stage + ": PickOverlappedL1Records should succeed");
+        if (!overlap_blocks.empty()) {
+            version->ResolveL1BlocksToTables(overlap_blocks, overlaps);
+        } else {
+            version->ResolveL1RecordsToTables(overlap_records, overlaps);
+        }
 
         bool found = false;
         for (const auto& overlap : overlaps) {

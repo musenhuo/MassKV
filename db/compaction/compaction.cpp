@@ -8,7 +8,10 @@
 #include "lib/ThreadPool/include/threadpool.h"
 #include "lib/ThreadPool/include/threadpool_imp.h"
 #include <algorithm>
+#include <atomic>
+#include <chrono>
 #include <cstdlib>
+#include <cstdio>
 #include <deque>
 #include <limits>
 #include <queue>
@@ -98,6 +101,41 @@ bool IsL1DeleteCoveredOnlyEnabled() {
     return enabled;
 }
 
+bool IsCompactionCleanTraceEnabled() {
+    static const bool enabled = []() {
+        bool parsed = false;
+        if (ParseEnvBool("FLOWKV_COMPACTION_CLEAN_TRACE", parsed)) {
+            return parsed;
+        }
+        if (ParseEnvBool("FLOWKV_COMPACTION_TRACE", parsed)) {
+            return parsed;
+        }
+        return false;
+    }();
+    return enabled;
+}
+
+uint64_t ReadProcessRSSBytesFromProc() {
+    std::FILE* file = std::fopen("/proc/self/statm", "r");
+    if (file == nullptr) {
+        return 0;
+    }
+    unsigned long total_pages = 0;
+    unsigned long resident_pages = 0;
+    const int scanned = std::fscanf(file, "%lu %lu", &total_pages, &resident_pages);
+    std::fclose(file);
+    if (scanned != 2) {
+        return 0;
+    }
+    const long page_size = sysconf(_SC_PAGESIZE);
+    if (page_size <= 0) {
+        return 0;
+    }
+    return static_cast<uint64_t>(resident_pages) * static_cast<uint64_t>(page_size);
+}
+
+std::atomic<uint64_t> g_clean_trace_invocation_id{0};
+
 bool AddEntryToBuilder(PSTBuilder* builder, const KeyType& key, const FixedValue16& value) {
 #if defined(FLOWKV_KEY16)
     uint8_t key_bytes[16];
@@ -110,10 +148,33 @@ bool AddEntryToBuilder(PSTBuilder* builder, const KeyType& key, const FixedValue
 #endif
 }
 
-bool ShouldDeleteL1ManifestSlot(const Manifest* manifest, const TaggedPstMeta& pst) {
-    return manifest != nullptr &&
-           manifest->IsL1TableTrackingEnabled() &&
-           pst.manifest_position != kInvalidManifestPosition;
+void PersistL1HybridStateOrExit(Version* version, Manifest* manifest) {
+    std::vector<uint8_t> l1_hybrid_state_bytes;
+    uint32_t current_l1_seq_no = 0;
+    if (!version->ExportL1HybridState(l1_hybrid_state_bytes, current_l1_seq_no) ||
+        !manifest->PersistL1HybridState(l1_hybrid_state_bytes, current_l1_seq_no)) {
+        ERROR_EXIT("L1 hybrid state persist failed, cannot continue");
+    }
+}
+
+void ReclaimObsoletePstsAfterCommit(PSTDeleter* pst_deleter,
+                                    const std::vector<TaggedPstMeta>& l1_tables_to_delete,
+                                    const std::vector<std::vector<TaggedPstMeta>>& inputs,
+                                    int tree_num) {
+    for (const auto& pst : l1_tables_to_delete) {
+        if (pst.level != NotOverlappedMark) {
+            pst_deleter->DeletePST(pst.meta);
+        }
+    }
+    for (int i = 0; i < tree_num; ++i) {
+        for (const auto& pst : inputs[i]) {
+            if (pst.level != NotOverlappedMark) {
+                assert(pst.level == 0);
+                pst_deleter->DeletePST(pst.meta);
+            }
+        }
+    }
+    pst_deleter->PersistCheckpoint();
 }
 
 class StepCPatchRecorder {
@@ -263,6 +324,8 @@ private:
         PSTReader::Iterator* iter = nullptr;
         uint16_t end_exclusive = 0;
         size_t record_idx = 0;
+        KeyType route_min_key{};
+        KeyType route_max_key{};
     };
 
     struct HeapEntry {
@@ -294,11 +357,19 @@ private:
         if (state.iter == nullptr) {
             return false;
         }
-        const uint16_t next_idx =
+        uint16_t next_idx =
             static_cast<uint16_t>(state.iter->current_record_index_ + 1);
-        if (next_idx < state.end_exclusive) {
+        while (next_idx < state.end_exclusive) {
             state.iter->current_record_index_ = next_idx;
-            heap_.push(HeapEntry{state.iter->Key(), state_idx});
+            const KeyType next_key = state.iter->Key();
+            if (CompareKeyType(next_key, state.route_min_key) < 0) {
+                next_idx = static_cast<uint16_t>(next_idx + 1);
+                continue;
+            }
+            if (CompareKeyType(next_key, state.route_max_key) > 0) {
+                break;
+            }
+            heap_.push(HeapEntry{next_key, state_idx});
             return true;
         }
         delete state.iter;
@@ -344,8 +415,25 @@ private:
                 continue;
             }
             iter->current_record_index_ = entry_begin;
+            const KeyType route_min_key = record.RouteMinKey();
+            const KeyType route_max_key = record.RouteMaxKey();
+            while (iter->current_record_index_ < entry_end &&
+                   CompareKeyType(iter->Key(), route_min_key) < 0) {
+                iter->current_record_index_ =
+                    static_cast<uint16_t>(iter->current_record_index_ + 1);
+            }
+            if (iter->current_record_index_ >= entry_end ||
+                CompareKeyType(iter->Key(), route_max_key) > 0) {
+                delete iter;
+                continue;
+            }
             const size_t state_idx = states_.size();
-            states_.push_back(ActiveState{iter, entry_end, record_idx});
+            states_.push_back(ActiveState{
+                iter,
+                entry_end,
+                record_idx,
+                route_min_key,
+                route_max_key});
             heap_.push(HeapEntry{iter->Key(), state_idx});
             return true;
         }
@@ -716,6 +804,34 @@ bool AreAllRecordsWindowReadable(const std::vector<SubtreeRecord>& records) {
     return true;
 }
 
+void SplitL1RecordsByWindowReadability(
+    const std::vector<SubtreeRecord>& records,
+    std::vector<SubtreeRecord>& readable_records,
+    std::vector<uint64_t>& unreadable_unique_blocks) {
+    readable_records.clear();
+    unreadable_unique_blocks.clear();
+    readable_records.reserve(records.size());
+
+    std::unordered_set<uint64_t> unreadable_blocks;
+    unreadable_blocks.reserve(records.size());
+    for (const auto& record : records) {
+        const auto window = record.LeafWindow();
+        if (window.count == 0) {
+            if (window.kv_block_ptr != 0) {
+                unreadable_blocks.insert(window.kv_block_ptr);
+            }
+            continue;
+        }
+        readable_records.push_back(record);
+    }
+
+    unreadable_unique_blocks.reserve(unreadable_blocks.size());
+    for (const uint64_t block_ptr : unreadable_blocks) {
+        unreadable_unique_blocks.push_back(block_ptr);
+    }
+    std::sort(unreadable_unique_blocks.begin(), unreadable_unique_blocks.end());
+}
+
 bool SubtreeRecordMinKeyLess(const SubtreeRecord& lhs, const SubtreeRecord& rhs) {
     const KeyType lhs_route_min = lhs.RouteMinKey();
     const KeyType rhs_route_min = rhs.RouteMinKey();
@@ -800,29 +916,47 @@ void NormalizeL1InputRecordsForMerge(std::vector<SubtreeRecord>& records) {
 
 const std::vector<TaggedPstMeta>* ResolveObsoleteL1TablesFromInputs(
     Version* version,
-    const std::vector<std::vector<TaggedPstMeta>>& inputs,
+    const std::vector<TaggedPstMeta>& l1_inputs,
     const std::vector<SubtreeRecord>& l1_records,
     const std::vector<uint64_t>& l1_unique_blocks,
     std::vector<TaggedPstMeta>& resolved_out) {
     resolved_out.clear();
     static const std::vector<TaggedPstMeta> kEmpty;
-    if (version == nullptr || inputs.empty()) {
+    if (version == nullptr) {
         return &kEmpty;
     }
 
-    const std::vector<TaggedPstMeta>& l1_inputs = inputs.back();
     if (!l1_inputs.empty()) {
         return &l1_inputs;
     }
 
-    std::vector<uint64_t> blocks = l1_unique_blocks;
-    if (blocks.empty() && !l1_records.empty()) {
-        blocks = CollectUniqueBlocksFromRecords(l1_records);
-    }
-    if (!blocks.empty()) {
-        version->ResolveL1BlocksToTables(blocks, resolved_out);
+    if (!l1_unique_blocks.empty()) {
+        version->ResolveL1BlocksToTables(l1_unique_blocks, resolved_out);
+    } else if (!l1_records.empty()) {
+        version->ResolveL1RecordsToTables(l1_records, resolved_out);
     }
     return resolved_out.empty() ? &kEmpty : &resolved_out;
+}
+
+bool MaterializeOverlappedL1TablesFromRecords(Version* version,
+                                              const KeyType& min,
+                                              const KeyType& max,
+                                              std::vector<TaggedPstMeta>& output) {
+    output.clear();
+    if (version == nullptr) {
+        return false;
+    }
+    std::vector<SubtreeRecord> records;
+    std::vector<uint64_t> unique_kv_block_ptrs;
+    if (!version->PickOverlappedL1Records(min, max, records, unique_kv_block_ptrs)) {
+        return false;
+    }
+    if (!unique_kv_block_ptrs.empty()) {
+        version->ResolveL1BlocksToTables(unique_kv_block_ptrs, output);
+    } else if (!records.empty()) {
+        version->ResolveL1RecordsToTables(records, output);
+    }
+    return true;
 }
 
 struct WindowInterval {
@@ -884,7 +1018,6 @@ bool IsEntryRangeFullyCovered(uint16_t entry_num, std::vector<WindowInterval> in
 std::vector<TaggedPstMeta> BuildDeletableL1Tables(
     const std::vector<TaggedPstMeta>& obsolete_l1_tables,
     const std::vector<SubtreeRecord>* delete_records,
-    bool delete_records_are_fallback,
     bool enable_coverage_guard) {
     if (obsolete_l1_tables.empty()) {
         return {};
@@ -892,7 +1025,7 @@ std::vector<TaggedPstMeta> BuildDeletableL1Tables(
     if (!enable_coverage_guard) {
         return obsolete_l1_tables;
     }
-    if (delete_records == nullptr || delete_records_are_fallback) {
+    if (delete_records == nullptr) {
         return obsolete_l1_tables;
     }
     const DeleteCoverageMap coverage = BuildDeleteCoverageMap(*delete_records);
@@ -1257,6 +1390,7 @@ size_t CompactionJob::PickCompaction()
 	}
 	inputs_l1_records_.clear();
 	inputs_l1_unique_blocks_.clear();
+	force_serial_compaction_ = false;
 	version_->PickLevel0Trees(inputs_, tree_metas);
 	size_t size = inputs_.size();
 	if (size == 0)
@@ -1289,14 +1423,32 @@ size_t CompactionJob::PickCompaction()
 			                                      max_key_,
 			                                      inputs_l1_records_,
 			                                      inputs_l1_unique_blocks_)) {
-			version_->PickOverlappedL1Tables(min_key_, max_key_, inputs_[size]);
+			MaterializeOverlappedL1TablesFromRecords(version_, min_key_, max_key_, inputs_[size]);
 		} else {
 			NormalizeL1InputRecordsForMerge(inputs_l1_records_);
 			if (!AreAllRecordsWindowReadable(inputs_l1_records_)) {
-				LOG("L1 range-record scan fallback to table execution due to non-window records");
-				inputs_l1_records_.clear();
-				inputs_l1_unique_blocks_.clear();
-				version_->PickOverlappedL1Tables(min_key_, max_key_, inputs_[size]);
+				std::vector<SubtreeRecord> readable_records;
+				std::vector<uint64_t> unreadable_unique_blocks;
+				SplitL1RecordsByWindowReadability(inputs_l1_records_,
+				                                readable_records,
+				                                unreadable_unique_blocks);
+				LOG("L1 range-record scan mixed fallback: total_records=%lu readable_records=%lu unreadable_blocks=%lu",
+				    inputs_l1_records_.size(),
+				    readable_records.size(),
+				    unreadable_unique_blocks.size());
+				inputs_l1_records_.swap(readable_records);
+				if (!inputs_l1_records_.empty()) {
+					inputs_l1_unique_blocks_ = CollectUniqueBlocksFromRecords(inputs_l1_records_);
+				} else {
+					inputs_l1_unique_blocks_.clear();
+				}
+				inputs_[size].clear();
+				if (!unreadable_unique_blocks.empty()) {
+					version_->ResolveL1BlocksToTables(unreadable_unique_blocks, inputs_[size]);
+				}
+				if (inputs_l1_records_.empty() && inputs_[size].empty()) {
+					LOG("L1 range-record scan fallback produced no usable L1 input");
+				}
 			} else {
 				if (inputs_l1_unique_blocks_.empty()) {
 					inputs_l1_unique_blocks_ = CollectUniqueBlocksFromRecords(inputs_l1_records_);
@@ -1308,7 +1460,14 @@ size_t CompactionJob::PickCompaction()
 			}
 		}
 	} else {
-		version_->PickOverlappedL1Tables(min_key_, max_key_, inputs_[size]);
+		MaterializeOverlappedL1TablesFromRecords(version_, min_key_, max_key_, inputs_[size]);
+	}
+	if (use_l1_range_scan_records_ && !inputs_l1_records_.empty() && !inputs_[size].empty()) {
+		force_serial_compaction_ = true;
+		LOG("L1 mixed-mode input detected: forcing serial compaction merge "
+		    "(readable_records=%lu materialized_tables=%lu)",
+		    inputs_l1_records_.size(),
+		    inputs_[size].size());
 	}
 	if (inputs_[size].size())
 	{
@@ -1331,6 +1490,8 @@ bool CompactionJob::RunCompaction()
 	std::priority_queue<KeyWithRowId, std::vector<KeyWithRowId>, UintKeyComparator> key_heap(cmp);
 	std::vector<RowIterator> table_rows;
 	std::vector<RecordIterator> record_rows;
+	std::deque<std::vector<TaggedPstMeta>> split_l1_table_rows;
+	std::vector<SubtreeRecord> partition_l1_records;
 	std::vector<PSTReader *> readers;
 	struct InputSource {
 		bool is_record = false;
@@ -1342,16 +1503,48 @@ bool CompactionJob::RunCompaction()
 	StepCPatchRecorder add_patch_recorder;
 
 	const bool has_l1_record_input =
-		use_l1_range_scan_records_ && AreAllRecordsWindowReadable(inputs_l1_records_);
+		use_l1_range_scan_records_ && !inputs_l1_records_.empty() &&
+		AreAllRecordsWindowReadable(inputs_l1_records_);
 	const int l1_bucket_idx = inputs_.empty() ? -1 : static_cast<int>(inputs_.size() - 1);
 
 	for (int i = 0; i < static_cast<int>(inputs_.size()); i++)
 	{
 		if (inputs_[i].empty()) {
+			if (!(has_l1_record_input && i == l1_bucket_idx)) {
+				continue;
+			}
+		}
+		if (has_l1_record_input && i == l1_bucket_idx && inputs_[i].empty()) {
+			// Record-only L1 execution: when readable windows exist, do not materialize
+			// the L1 input into a table list for the merge loop.
 			continue;
 		}
 		if (has_l1_record_input && i == l1_bucket_idx) {
-			// L1 执行面改为 record-only：有 records 时不再把 L1 table 列表接入归并循环。
+			std::vector<TaggedPstMeta> split_tables = inputs_[i];
+			std::stable_sort(split_tables.begin(), split_tables.end(),
+			                 [](const TaggedPstMeta& lhs, const TaggedPstMeta& rhs) {
+				                 if (lhs.meta.seq_no_ != rhs.meta.seq_no_) {
+					                 return lhs.meta.seq_no_ > rhs.meta.seq_no_;
+				                 }
+				                 const int min_cmp = CompareKeyType(lhs.meta.MinKey(), rhs.meta.MinKey());
+				                 if (min_cmp != 0) {
+					                 return min_cmp < 0;
+				                 }
+				                 const int max_cmp = CompareKeyType(lhs.meta.MaxKey(), rhs.meta.MaxKey());
+				                 if (max_cmp != 0) {
+					                 return max_cmp < 0;
+				                 }
+				                 return lhs.meta.datablock_ptr_ < rhs.meta.datablock_ptr_;
+			                 });
+			for (const auto& table : split_tables) {
+				split_l1_table_rows.emplace_back();
+				split_l1_table_rows.back().push_back(table);
+				auto pr = new PSTReader(seg_allocater_);
+				readers.push_back(pr);
+				table_rows.emplace_back(pr, split_l1_table_rows.back());
+				table_rows.back().ResetPstIter();
+				sources.push_back(InputSource{false, table_rows.size() - 1});
+			}
 			continue;
 		}
 		auto pr = new PSTReader(seg_allocater_);
@@ -1444,10 +1637,43 @@ bool CompactionJob::RunCompaction()
 				           current_max_key.key.hi, current_max_key.key.lo, current_max_key.row_id,
 				           source.index);
 			}
-			ERROR_EXIT("Reverse order found in Compaction: %lu:%lu(%d)<%lu:%lu(%d), source=table[%zu], pst_idx=%d",
-			           topkey.key.hi, topkey.key.lo, topkey.row_id,
-			           current_max_key.key.hi, current_max_key.key.lo, current_max_key.row_id,
-			           source.index, table_rows[source.index].current_pst_idx_);
+			if (!source.is_record) {
+				RowIterator &row = table_rows[source.index];
+				const auto pst = row.GetPst();
+				auto pr = readers[source.index];
+				auto *dbg_iter = pr == nullptr ? nullptr : pr->GetIterator(pst.meta.datablock_ptr_);
+				uint64_t k0_hi = 0, k0_lo = 0, k1_hi = 0, k1_lo = 0, k2_hi = 0, k2_lo = 0;
+				size_t dbg_size = 0;
+				if (dbg_iter != nullptr) {
+					dbg_size = dbg_iter->RecordsSize();
+					if (dbg_size > 0) {
+						auto k = dbg_iter->Key();
+						k0_hi = k.hi;
+						k0_lo = k.lo;
+					}
+					if (dbg_size > 1) {
+						dbg_iter->current_record_index_ = 1;
+						auto k = dbg_iter->Key();
+						k1_hi = k.hi;
+						k1_lo = k.lo;
+					}
+					if (dbg_size > 2) {
+						dbg_iter->current_record_index_ = 2;
+						auto k = dbg_iter->Key();
+						k2_hi = k.hi;
+						k2_lo = k.lo;
+					}
+					delete dbg_iter;
+				}
+				ERROR_EXIT("Reverse order found in Compaction: %lu:%lu(%d)<%lu:%lu(%d), source=table[%zu], pst_idx=%d, datablock_ptr=%lu, min=%lu:%lu, max=%lu:%lu, entry_num=%u, dbg_size=%lu, first_keys=%lu:%lu|%lu:%lu|%lu:%lu",
+				           topkey.key.hi, topkey.key.lo, topkey.row_id,
+				           current_max_key.key.hi, current_max_key.key.lo, current_max_key.row_id,
+				           source.index, row.current_pst_idx_, pst.meta.datablock_ptr_,
+				           pst.meta.min_key_hi, pst.meta.min_key_lo,
+				           pst.meta.max_key_hi, pst.meta.max_key_lo,
+				           pst.meta.entry_num_, dbg_size,
+				           k0_hi, k0_lo, k1_hi, k1_lo, k2_hi, k2_lo);
+			}
 			#else
 			if (source.is_record) {
 				ERROR_EXIT("Reverse order found in Compaction: %lu(%d)<%lu(%d), source=record[%zu]",
@@ -1585,6 +1811,8 @@ void CompactionJob::RunSubCompaction(int partition_id)
 	std::priority_queue<KeyWithRowId, std::vector<KeyWithRowId>, UintKeyComparator> key_heap(cmp);
 	std::vector<RowIterator> table_rows;
 	std::vector<RecordIterator> record_rows;
+	std::deque<std::vector<TaggedPstMeta>> split_l1_table_rows;
+	std::vector<SubtreeRecord> partition_l1_records;
 	std::vector<PSTReader *> readers;
 	struct InputSource {
 		bool is_record = false;
@@ -1595,16 +1823,49 @@ void CompactionJob::RunSubCompaction(int partition_id)
 	PartitionInfo &partition = partition_info_[partition_id];
 
 	const bool has_l1_record_input =
-		use_l1_range_scan_records_ && AreAllRecordsWindowReadable(inputs_l1_records_);
+		use_l1_range_scan_records_ && !inputs_l1_records_.empty() &&
+		AreAllRecordsWindowReadable(inputs_l1_records_);
 	const int l1_bucket_idx = inputs_.empty() ? -1 : static_cast<int>(inputs_.size() - 1);
 
 	// initialize: init iterators, move to partition min key, push first key to heap
 	for (int i = 0; i < static_cast<int>(inputs_.size()); i++)
 	{
 		if (inputs_[i].empty()) {
+			if (!(has_l1_record_input && i == l1_bucket_idx)) {
+				continue;
+			}
+		}
+		if (has_l1_record_input && i == l1_bucket_idx && inputs_[i].empty()) {
 			continue;
 		}
 		if (has_l1_record_input && i == l1_bucket_idx) {
+			std::vector<TaggedPstMeta> split_tables = inputs_[i];
+			std::stable_sort(split_tables.begin(), split_tables.end(),
+			                 [](const TaggedPstMeta& lhs, const TaggedPstMeta& rhs) {
+				                 if (lhs.meta.seq_no_ != rhs.meta.seq_no_) {
+					                 return lhs.meta.seq_no_ > rhs.meta.seq_no_;
+				                 }
+				                 const int min_cmp = CompareKeyType(lhs.meta.MinKey(), rhs.meta.MinKey());
+				                 if (min_cmp != 0) {
+					                 return min_cmp < 0;
+				                 }
+				                 const int max_cmp = CompareKeyType(lhs.meta.MaxKey(), rhs.meta.MaxKey());
+				                 if (max_cmp != 0) {
+					                 return max_cmp < 0;
+				                 }
+				                 return lhs.meta.datablock_ptr_ < rhs.meta.datablock_ptr_;
+			                 });
+			for (const auto& table : split_tables) {
+				split_l1_table_rows.emplace_back();
+				split_l1_table_rows.back().push_back(table);
+				auto pr = new PSTReader(seg_allocater_);
+				readers.push_back(pr);
+				table_rows.emplace_back(pr, split_l1_table_rows.back());
+				if (!table_rows.back().MoveTo(partition.min_key)) {
+					continue;
+				}
+				sources.push_back(InputSource{false, table_rows.size() - 1});
+			}
 			continue;
 		}
 		auto pr = new PSTReader(seg_allocater_);
@@ -1617,10 +1878,20 @@ void CompactionJob::RunSubCompaction(int partition_id)
 	}
 	if (has_l1_record_input)
 	{
+		partition_l1_records.reserve(inputs_l1_records_.size() / RANGE_PARTITION_NUM + 16);
+		for (const auto& record : inputs_l1_records_) {
+			if (KeyTypeLess(record.RouteMaxKey(), partition.min_key)) {
+				continue;
+			}
+			if (KeyTypeLess(partition.max_key, record.RouteMinKey())) {
+				break;
+			}
+			partition_l1_records.push_back(record);
+		}
 		auto pr = new PSTReader(seg_allocater_);
 		readers.push_back(pr);
-		record_rows.emplace_back(pr, inputs_l1_records_);
-		if (record_rows.back().MoveTo(partition.min_key)) {
+		record_rows.emplace_back(pr, partition_l1_records);
+		if (record_rows.back().Valid()) {
 			sources.push_back(InputSource{true, record_rows.size() - 1});
 		}
 	}
@@ -1843,23 +2114,18 @@ void CompactionJob::CleanCompaction()
 	std::vector<TaggedPstMeta> resolved_obsolete_l1_tables;
 	const std::vector<TaggedPstMeta>* obsolete_l1_tables_ptr =
 		ResolveObsoleteL1TablesFromInputs(version_,
-		                                 inputs_,
+		                                 inputs_.back(),
 		                                 inputs_l1_records_,
 		                                 inputs_l1_unique_blocks_,
 		                                 resolved_obsolete_l1_tables);
 	const std::vector<TaggedPstMeta>& obsolete_l1_tables = *obsolete_l1_tables_ptr;
-	bool delete_records_are_fallback = false;
+	std::vector<SubtreeRecord> delete_records_storage;
 	const std::vector<SubtreeRecord>* delete_records_for_guard = nullptr;
 	if (use_l1_range_scan_records_) {
 		const std::vector<SubtreeRecord> add_records =
 			BuildAddRecordsWithFallback(outputs_, add_patch_records_, inputs_l1_records_);
-		std::vector<SubtreeRecord> delete_records_fallback;
-		const std::vector<SubtreeRecord>* delete_records = &inputs_l1_records_;
-		if (delete_records->empty()) {
-			delete_records_fallback = BuildSyntheticRecordsFromTables(obsolete_l1_tables);
-			delete_records = &delete_records_fallback;
-			delete_records_are_fallback = true;
-		}
+		delete_records_storage = BuildSyntheticRecordsFromTables(obsolete_l1_tables);
+		const std::vector<SubtreeRecord>* delete_records = &delete_records_storage;
 		delete_records_for_guard = delete_records;
 		version_->SetPendingL1DeltaBatch(
 			BuildL1DeltaBatchFromRecords(add_records, *delete_records, output_seq_no_, output_seq_no_));
@@ -1875,7 +2141,7 @@ void CompactionJob::CleanCompaction()
 	{
 		pst.meta.seq_no_ = output_seq_no_;
 		pst.level = 1;
-		pst.manifest_position = manifest_->AddTable(pst.meta, 1);
+		pst.manifest_position = kInvalidManifestPosition;
 		version_->InsertTableToL1(pst);
 	}
 	pst_builder_.PersistCheckpoint();
@@ -1888,24 +2154,11 @@ void CompactionJob::CleanCompaction()
 	const std::vector<TaggedPstMeta> l1_tables_to_delete = BuildDeletableL1Tables(
 		obsolete_l1_tables,
 		delete_records_for_guard,
-		delete_records_are_fallback,
 		use_l1_delete_covered_only_);
 	// delete inputs[-1](except for .level=1) from level 1 index
 	for (const auto &pst : l1_tables_to_delete)
 	{
-		// recycle segment space, note that no need to recycle pst whose seq_no = output_seq_no_
 		version_->DeleteTableInL1(pst.meta);
-		if (pst.level != NotOverlappedMark)
-		{
-			pst_deleter_.DeletePST(pst.meta);
-		}
-	}
-	pst_deleter_.PersistCheckpoint();
-	for (const auto &pst : l1_tables_to_delete)
-	{
-		if (ShouldDeleteL1ManifestSlot(manifest_, pst)) {
-			manifest_->DeleteTable(static_cast<int>(pst.manifest_position), 1);
-		}
 	}
 	// delete level 0 trees;
 	for (int i = 0; i < tree_num; i++)
@@ -1914,33 +2167,16 @@ void CompactionJob::CleanCompaction()
 
 		for (auto &pst : inputs_[i])
 		{
-			// DEBUG("delete pst in inputs_[%d]",i);
-			// recycle segment space, note that no need to recycle pst whose seq_no = output_seq_no_
-			// Better to wait for the reader to finish reading
-			if (pst.level != NotOverlappedMark)
-			{
-				assert(pst.level == 0);
-				pst_deleter_.DeletePST(pst.meta);
-			}
 			manifest_->DeleteTable(pst.manifest_position, 0);
 		}
 	}
 	version_->EndL1BatchUpdate();
-	pst_deleter_.PersistCheckpoint();
-
-	std::vector<uint8_t> l1_hybrid_state_bytes;
-	uint32_t current_l1_seq_no = 0;
-	if (version_->ExportL1HybridState(l1_hybrid_state_bytes, current_l1_seq_no)) {
-		if (!manifest_->PersistL1HybridState(l1_hybrid_state_bytes, current_l1_seq_no)) {
-			manifest_->ClearL1HybridState();
-		}
-	} else {
-		manifest_->ClearL1HybridState();
-	}
+	PersistL1HybridStateOrExit(version_, manifest_);
 
 	if (!manifest_->CommitBatchUpdate()) {
 		ERROR_EXIT("manifest batch commit failed in CleanCompaction");
 	}
+	ReclaimObsoletePstsAfterCommit(&pst_deleter_, l1_tables_to_delete, inputs_, tree_num);
 
 	total_L1_num = total_L1_num + outputs_.size() - l1_tables_to_delete.size();
 	LOG("L1 add %lu pst, delete %lu/%lu pst, total %lu pst",
@@ -1956,32 +2192,61 @@ void CompactionJob::CleanCompaction()
 }
 void CompactionJob::CleanCompactionWhenUsingSubCompaction()
 {
+	const bool clean_trace_enabled = IsCompactionCleanTraceEnabled();
+	const uint64_t clean_trace_invocation_id =
+		g_clean_trace_invocation_id.fetch_add(1, std::memory_order_relaxed) + 1;
+	const auto clean_trace_begin = std::chrono::steady_clock::now();
+	size_t merged_outputs_count = 0;
+	size_t obsolete_l1_tables_count = 0;
+	size_t l1_tables_to_delete_count = 0;
+	int tree_num = -1;
+	const auto emit_clean_trace = [&](const char* stage) {
+		if (!clean_trace_enabled) {
+			return;
+		}
+		const auto now = std::chrono::steady_clock::now();
+		const double elapsed_ms =
+			static_cast<double>(
+				std::chrono::duration_cast<std::chrono::microseconds>(now - clean_trace_begin).count()) /
+			1000.0;
+		std::cout << "[CLEAN_TRACE]"
+		          << " invocation_id=" << clean_trace_invocation_id
+		          << " stage=" << stage
+		          << " elapsed_ms=" << elapsed_ms
+		          << " rss_bytes=" << ReadProcessRSSBytesFromProc()
+		          << " merged_outputs=" << merged_outputs_count
+		          << " obsolete_l1_tables=" << obsolete_l1_tables_count
+		          << " l1_tables_to_delete=" << l1_tables_to_delete_count
+		          << " tree_num=" << tree_num
+		          << "\n";
+	};
+	emit_clean_trace("entry");
+
 	if (!manifest_->BeginBatchUpdate()) {
 		ERROR_EXIT("manifest begin batch failed in CleanCompactionWhenUsingSubCompaction");
 	}
 	const std::vector<TaggedPstMeta> merged_outputs = GatherSubCompactionOutputs(partition_outputs_);
+	merged_outputs_count = merged_outputs.size();
 	std::vector<TaggedPstMeta> resolved_obsolete_l1_tables;
 	const std::vector<TaggedPstMeta>* obsolete_l1_tables_ptr =
 		ResolveObsoleteL1TablesFromInputs(version_,
-		                                 inputs_,
+		                                 inputs_.back(),
 		                                 inputs_l1_records_,
 		                                 inputs_l1_unique_blocks_,
 		                                 resolved_obsolete_l1_tables);
 	const std::vector<TaggedPstMeta>& obsolete_l1_tables = *obsolete_l1_tables_ptr;
-	bool delete_records_are_fallback = false;
+	obsolete_l1_tables_count = obsolete_l1_tables.size();
+	emit_clean_trace("after_collect_inputs");
+
+	std::vector<SubtreeRecord> delete_records_storage;
 	const std::vector<SubtreeRecord>* delete_records_for_guard = nullptr;
 	if (use_l1_range_scan_records_) {
 		const std::vector<SubtreeRecord> merged_add_patch_records =
 			MergeSubCompactionAddPatchRecords(partition_add_patch_records_);
 		const std::vector<SubtreeRecord> add_records =
 			BuildAddRecordsWithFallback(merged_outputs, merged_add_patch_records, inputs_l1_records_);
-		std::vector<SubtreeRecord> delete_records_fallback;
-		const std::vector<SubtreeRecord>* delete_records = &inputs_l1_records_;
-		if (delete_records->empty()) {
-			delete_records_fallback = BuildSyntheticRecordsFromTables(obsolete_l1_tables);
-			delete_records = &delete_records_fallback;
-			delete_records_are_fallback = true;
-		}
+		delete_records_storage = BuildSyntheticRecordsFromTables(obsolete_l1_tables);
+		const std::vector<SubtreeRecord>* delete_records = &delete_records_storage;
 		delete_records_for_guard = delete_records;
 		version_->SetPendingL1DeltaBatch(
 			BuildL1DeltaBatchFromRecords(add_records, *delete_records, output_seq_no_, output_seq_no_));
@@ -1991,7 +2256,10 @@ void CompactionJob::CleanCompactionWhenUsingSubCompaction()
 		version_->SetPendingL1DeltaBatch(
 			BuildL1DeltaBatchFromTables(merged_outputs, obsolete_l1_tables, seg_allocater_, output_seq_no_, output_seq_no_));
 	}
+	emit_clean_trace("after_set_pending_delta");
 	version_->BeginL1BatchUpdate();
+	emit_clean_trace("after_begin_l1_batch");
+
 	// 1. add outputs to level 1 index
 	for (int i = 0; i < RANGE_PARTITION_NUM; i++)
 	{
@@ -2000,41 +2268,35 @@ void CompactionJob::CleanCompactionWhenUsingSubCompaction()
 		{
 			pst.meta.seq_no_ = output_seq_no_;
 			pst.level = 1;
-			pst.manifest_position = manifest_->AddTable(pst.meta, 1);
+			pst.manifest_position = kInvalidManifestPosition;
 			version_->InsertTableToL1(pst);
 		}
 		partition_pst_builder_[i]->PersistCheckpoint();
 		delete partition_pst_builder_[i];
 	}
+	emit_clean_trace("after_add_outputs");
 
 	// 2. change version in manifest
 	manifest_->UpdateL1Version(output_seq_no_);
-	int tree_num = inputs_.size() - 1;
+	tree_num = inputs_.size() - 1;
 	manifest_->UpdateL0Version(manifest_->GetL0Version() + tree_num);
+	emit_clean_trace("after_update_versions");
 
 	// 3. delete obsolute PSTs
 	const std::vector<TaggedPstMeta> l1_tables_to_delete = BuildDeletableL1Tables(
 		obsolete_l1_tables,
 		delete_records_for_guard,
-		delete_records_are_fallback,
 		use_l1_delete_covered_only_);
+	l1_tables_to_delete_count = l1_tables_to_delete.size();
+	emit_clean_trace("after_build_delete_set");
+
 	// delete inputs[-1](except for .level=1) from level 1 index
 	for (const auto &pst : l1_tables_to_delete)
 	{
-		// recycle segment space, note that no need to recycle pst whose seq_no = output_seq_no_
 		version_->DeleteTableInL1(pst.meta);
-		if (pst.level != NotOverlappedMark)
-		{
-			pst_deleter_.DeletePST(pst.meta);
-		}
 	}
-	pst_deleter_.PersistCheckpoint();
-	for (const auto &pst : l1_tables_to_delete)
-	{
-		if (ShouldDeleteL1ManifestSlot(manifest_, pst)) {
-			manifest_->DeleteTable(static_cast<int>(pst.manifest_position), 1);
-		}
-	}
+	emit_clean_trace("after_delete_l1_tables");
+
 	// delete level 0 trees;
 	for (int i = 0; i < tree_num; i++)
 	{
@@ -2042,37 +2304,27 @@ void CompactionJob::CleanCompactionWhenUsingSubCompaction()
 
 		for (auto &pst : inputs_[i])
 		{
-			// DEBUG("delete pst in inputs_[%d]",i);
-			// recycle segment space, note that no need to recycle pst whose seq_no = output_seq_no_
-			// Better to wait for the reader to finish reading
-			if (pst.level != NotOverlappedMark)
-			{
-				assert(pst.level == 0);
-				pst_deleter_.DeletePST(pst.meta);
-			}
 			manifest_->DeleteTable(pst.manifest_position, 0);
 		}
 	}
+	emit_clean_trace("after_delete_l0_tables");
+	emit_clean_trace("before_end_l1_batch");
 	version_->EndL1BatchUpdate();
-	pst_deleter_.PersistCheckpoint();
-
-	std::vector<uint8_t> l1_hybrid_state_bytes;
-	uint32_t current_l1_seq_no = 0;
-	if (version_->ExportL1HybridState(l1_hybrid_state_bytes, current_l1_seq_no)) {
-		if (!manifest_->PersistL1HybridState(l1_hybrid_state_bytes, current_l1_seq_no)) {
-			manifest_->ClearL1HybridState();
-		}
-	} else {
-		manifest_->ClearL1HybridState();
-	}
+	emit_clean_trace("after_end_l1_batch");
+	PersistL1HybridStateOrExit(version_, manifest_);
+	emit_clean_trace("after_persist_l1_hybrid_state");
 
 	if (!manifest_->CommitBatchUpdate()) {
 		ERROR_EXIT("manifest batch commit failed in CleanCompactionWhenUsingSubCompaction");
 	}
+	emit_clean_trace("after_commit_batch");
+	ReclaimObsoletePstsAfterCommit(&pst_deleter_, l1_tables_to_delete, inputs_, tree_num);
+	emit_clean_trace("after_delete_checkpoint");
 	if (use_l1_delete_covered_only_ && l1_tables_to_delete.size() < obsolete_l1_tables.size()) {
 		LOG("L1 delete guard(subcompaction) retained %lu obsolete tables due to partial coverage",
 		    obsolete_l1_tables.size() - l1_tables_to_delete.size());
 	}
+	emit_clean_trace("function_end");
 }
 bool CompactionJob::RollbackCompaction()
 {

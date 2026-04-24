@@ -409,6 +409,11 @@ public:
     {
         // printf("before free ti\n");
         // print_dram_consuption();
+        if (tis[0] != nullptr) {
+            // Ensure tree nodes (and their ksuffix malloc allocations) enter
+            // the reclaim path before threadinfo pools are released.
+            table_.destroy(*tis[0]);
+        }
         for (int i = 0; i < 65; i++)
         {
             if (tis[i] != nullptr)
@@ -804,6 +809,25 @@ public:
             }
         }
 
+        return total_bytes;
+    }
+
+    /**
+     * @brief Estimate bytes currently reserved by Masstree thread pools.
+     *
+     * This counts per-thread `threadinfo` pool chunks (typically 2MB each)
+     * that back node allocations and may include unused slack.
+     */
+    size_t EstimateThreadInfoPoolBytes() const
+    {
+        size_t total_bytes = 0;
+        for (int i = 0; i < 65; ++i)
+        {
+            if (tis[i] != nullptr)
+            {
+                total_bytes += tis[i]->debug_allocated_pool_bytes();
+            }
+        }
         return total_bytes;
     }
 

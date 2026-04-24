@@ -1,123 +1,169 @@
-# FlowKV
-A multi-stage key-value store for high performance and memory efficiency on persistent memory
+# MassKV
 
-## Directory contents
-* `include/db.h`: FlowKV interface
-* `include/config.h`: static (macro defination) and dynamic (parameters) configurations.
-* `db/`: implementation of FlowKV
-* `db/allocator/`: the coarse-grained PM allocator
-* `db/blocks/`: structures of index block and data block
-* `db/compaction/`: implementation of flush and compaction
-* `lib/`: code we modified from external libraries, mainly including [Masstree](https://github.com/kohler/masstree-beta) and [RocksDB](https://github.com/facebook/rocksdb) thread pool.
-* `util/`: some utilities
+MassKV is an experimental persistent key-value store derived from FlowKV. The
+current codebase focuses on high-throughput writes, persistent recovery, and a
+memory-efficient L1 index for read-heavy workloads on fast SSD or persistent
+memory devices.
 
-include/db.h: FlowKV 接口定义
+The engine keeps the public FlowKV-style API (`MYDB` and `MYDBClient`) while
+adding a hybrid L1 route/subtree index, persistent table metadata recovery, and
+benchmark suites for point lookup, online write performance, correctness
+regression, and YCSB-style workloads.
 
-include/config.h: 静态（宏定义）和动态（参数）配置
+## Features
 
-db/: FlowKV 的具体实现代码
+- Log-structured write path: `Put` writes WAL records, updates memtables, and
+  lets background flush/compaction move data into persistent sorted tables.
+- Persistent sorted tables (PST): fixed-format sorted data blocks are managed
+  through a segment allocator and tracked by manifest/version metadata.
+- Hybrid L1 index: hot route metadata stays in DRAM while colder subtree data
+  can be persisted and loaded on demand, reducing resident memory pressure.
+- Recovery support: manifest replay and WAL recovery rebuild the in-memory
+  version view and pending memtable state.
+- 16-byte key/value experiment path: `FLOWKV_KEY16` enables the current
+  16B-key and 16B-value benchmark configuration used by recent experiments.
+- Experiment harnesses: correctness regression, point lookup, online write, and
+  YCSB-style benchmarks live under `experiments/`.
 
-db/allocator/: 粗粒度的 PM（持久内存）分配器
+## Repository Layout
 
-db/blocks/: 索引块和数据块的结构定义
+| Path | Purpose |
+| --- | --- |
+| `include/` | Public API, runtime config, key/value/log format definitions |
+| `db/` | Core engine implementation: WAL, PST, manifest/version, flush, compaction, allocator |
+| `lib/masstree/` | Modified Masstree implementation used by memtable and index paths |
+| `lib/hybrid_l1/` | Hybrid L1 route/subtree index implementation |
+| `lib/hmasstree/` | H-Masstree related experimental code |
+| `lib/ThreadPool/` | Thread pool code used by background workers |
+| `benchmarks/` | Simple benchmark executable |
+| `tests/` | Unit and smoke tests registered with CTest |
+| `experiments/` | Reproducible experiment programs, batch runners, and report scripts |
+| `docs/` | Design and maintenance notes for internal modules |
 
-db/compaction/: Flush（刷盘）和 Compaction（合并/压实）的实现
+## Dependencies
 
-lib/: 我们修改自外部库的代码，主要包括 Masstree 和 RocksDB 的线程池
+- Linux
+- CMake 3.14 or newer
+- C++17 compiler
+- gflags
+- PMDK `libpmem`
+- pthread
+- x86 CPU support for the flags used in `CMakeLists.txt` (`-mavx`, `-mavx2`,
+  `-mbmi`, `-mbmi2`, `-mlzcnt`, `-mssse3`)
 
-util/: 一些通用工具/组件
+On Ubuntu-like systems, the main packages are typically:
 
-## Terminology Correspondence between our paper and codes
-| In the paper               | In the code                                |
-| -------------------------- | ------------------------------------------ |
-| Chunk                      | Segment                                    |
-| Logical sorted table (LST) | Persistent sorted table (PST)              |
-| FastStore                  | Memtable                                   |
-| Manifest                   | Version (volatile) + Manifest (persistent) |
-| BufferStore                | Level 0 (L0)                               |
-| Buffer-tree                | Level 0 tree                               |
-| StableStore                | Level 1 (L1)                               |
-
-论文中的术语,代码中的术语
-Chunk（块）,Segment（段）
-Logical sorted table (LST),Persistent sorted table (PST)
-FastStore,Memtable
-Manifest,Version (易失性内存中) + Manifest (持久化存储中)
-BufferStore,Level 0 (L0)
-Buffer-tree,Level 0 tree
-StableStore,Level 1 (L1)
-
-## Building
-
-Dependencies:
-- CMake
-- [gflags](https://github.com/gflags/gflags) 
-- [PMDK](https://github.com/pmem/pmdk) (libpmem) 
-
-FlowKV is based on persistent memory. So a configured PM path is necessary. 
-If you have a configured PM path, skip this step.
-```shell
-# set Optane DCPMM to AppDirect mode
-$ sudo ipmctl create -f -goal persistentmemorytype=appdirect
-
-# configure PM device to fsdax mode
-$ sudo ndctl create-namespace -m fsdax
-
-# create and mount a file system with DAX
-$ sudo mkfs.ext4 -f /dev/pmem0
-$ sudo mount -o dax /dev/pmem0 /mnt/pmem
+```bash
+sudo apt-get install cmake g++ libgflags-dev libpmem-dev
 ```
 
-Build FlowKV with CMake:
-```shell
-$ cmake -B build -DKV_SEPARATION=ON/OFF # enable/disable key-value separation for supporting variable-sized value
-$ cmake --build build -j${n_proc}
+## Build
+
+```bash
+git clone https://github.com/musenhuo/MassKV.git
+cd MassKV
+cmake -S . -B build -DKV_SEPARATION=ON -DFLOWKV_KEY16=ON
+cmake --build build -j
 ```
 
-A static library (./build/libflowkv.a) and a benchmarking tool (./build/benchmarks/benchmark) will be generated.
+The default build creates `libflowkv.a`, `build/benchmarks/benchmark`, test
+binaries, and enabled experiment binaries.
 
-## Running benchmark
+Important build options:
 
-```
-sudo ./build/benchmarks/benchmark
-```
-Parameters:
-```
--benchmarks (write: random update, read: random get) type: string
-      default: "read"
--num (total number of data) type: uint64 default: 200000000
--num_ops (number of operations for each benchmark) type: uint64
-      default: 100000000
--pool_path (directory of target pmem) type: string
-      default: "/mnt/pmem/flowkv"
--pool_size_GB (total size of pmem pool) type: uint64 default: 40
--recover (recover an existing db instead of recreating a new one)
-      type: bool default: false
--skip_load (skip the load data step) type: bool default: false
--threads (number of user threads during loading and benchmarking)
-      type: uint64 default: 1
--value_size (value size, only available with KV separation enabled) 
-      type: uint64 default: 8
+| Option | Default | Meaning |
+| --- | --- | --- |
+| `KV_SEPARATION` | `ON` | Enables index-log memtable and value separation support |
+| `FLOWKV_KEY16` | `OFF` | Enables the 16-byte fixed key path used by current experiments |
+
+## Storage Configuration
+
+`MYDBConfig` controls the persistent pool path, pool size, recovery mode, direct
+I/O mode, and background thread counts. The current default pool path is
+`/dev/nvme1n1`, so most users should pass an explicit path before running
+benchmarks or tests.
+
+Example configuration in C++:
+
+```cpp
+MYDBConfig cfg("/mnt/pmem/masskv.pool");
+cfg.pm_pool_size = 40ul << 30;
+cfg.recover = false;
+cfg.use_direct_io = false;
+
+MYDB db(cfg);
+auto client = db.GetClient();
 ```
 
--benchmarks (类型: string, 默认: "read")
-      指定测试类型 (write: 随机更新, read: 随机读取)
--num (类型: uint64, 默认: 200000000)
-      数据总量
--num_ops (类型: uint64, 默认: 100000000)
-      每个基准测试的操作次数
--pool_path (类型: string, 默认: "/mnt/pmem/flowkv")
-      目标 pmem 的目录路径
--pool_size_GB (类型: uint64, 默认: 40)
-      pmem 内存池的总大小 (GB)
--recover (类型: bool, 默认: false)
-      恢复现有的数据库，而不是重新创建一个新的
--skip_load (类型: bool, 默认: false)
-      跳过数据加载 (Load) 步骤
--threads (类型: uint64, 默认: 1)
-      加载和基准测试期间的用户线程数
--value_size (类型: uint64, 默认: 8)
-      Value 的大小 (仅在启用 KV 分离时有效)
+For DAX persistent memory deployments, prepare and mount the device before
+running MassKV. For SSD-backed experiments, choose a device/file path that is
+safe to overwrite and has enough capacity for the configured pool size.
 
-## For comparisons with baselines
-We did macro-benchmarks and comparison experiments with [PKBench](https://github.com/luziyi23/PKBench) which is our modified version of [PiBench](https://github.com/sfu-dis/pibench) for PM-based key-value stores. Please see PKBench repository for more in-depth benchmarking.
+## Basic Benchmark
+
+```bash
+sudo ./build/benchmarks/benchmark \
+  --benchmarks=read \
+  --num=100000000 \
+  --num_ops=10000000 \
+  --threads=16 \
+  --pool_path=/mnt/pmem/masskv.pool \
+  --pool_size_GB=500
+```
+
+Useful flags include:
+
+| Flag | Meaning |
+| --- | --- |
+| `--benchmarks=read|write` | Random read or random update benchmark |
+| `--num` | Number of loaded records |
+| `--num_ops` | Number of benchmark operations |
+| `--threads` | User thread count |
+| `--pool_path` | Persistent pool path |
+| `--pool_size_GB` | Persistent pool size |
+| `--recover` | Open an existing database and run recovery |
+| `--skip_load` | Skip the loading phase |
+| `--use_direct_io` | Use `O_DIRECT` for supported PST reads |
+
+## Tests and Experiments
+
+Run registered tests:
+
+```bash
+ctest --test-dir build --output-on-failure
+```
+
+Representative experiment entry points:
+
+```bash
+# Point lookup benchmark
+./build/experiments/performance_evaluation/01_point_lookup/point_lookup_benchmark
+
+# Online write benchmark
+./build/experiments/performance_evaluation/03_compaction_update/write_online_benchmark
+
+# Phase 2 acceptance tests
+./experiments/performance_evaluation/03_compaction_update/run_phase2_acceptance.sh build
+```
+
+Batch runners and report generators are stored beside each experiment program.
+Large result directories, build directories, and scratch analysis artifacts are
+intentionally ignored by Git.
+
+## Terminology
+
+| Paper term | Code term |
+| --- | --- |
+| Chunk | Segment |
+| Logical sorted table (LST) | Persistent sorted table (PST) |
+| FastStore | Memtable |
+| Manifest | Version in memory plus Manifest on persistent storage |
+| BufferStore | Level 0 (L0) |
+| Buffer-tree | Level 0 tree |
+| StableStore | Level 1 (L1) |
+
+## Notes
+
+MassKV is a research prototype. Before running on a real device, review
+`MYDBConfig`, benchmark flags, and the selected pool path carefully because the
+engine may create or overwrite persistent data files/devices.

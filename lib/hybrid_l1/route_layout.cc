@@ -63,9 +63,9 @@ FixedRouteLayout::~FixedRouteLayout() {
 
 void FixedRouteLayout::InitializePartitions(std::vector<RoutePartition>& partitions) const {
     partitions.clear();
+    ReleaseColdResources();
     route_descriptor_index_.reset();
     route_entry_count_ = 0;
-    ReleaseColdResources();
 }
 
 void FixedRouteLayout::RefreshPartitions(std::vector<RoutePartition>& partitions) const {
@@ -290,6 +290,13 @@ size_t FixedRouteLayout::EstimateRouteDescriptorIndexMemoryUsageBytes() const {
     return route_descriptor_index_->EstimateMemoryUsageBytes();
 }
 
+size_t FixedRouteLayout::EstimateRouteDescriptorPoolBytes() const {
+    if (route_descriptor_index_ == nullptr) {
+        return 0;
+    }
+    return route_descriptor_index_->EstimateThreadInfoPoolBytes();
+}
+
 size_t FixedRouteLayout::ColdStubCount() const {
     return cold_stubs_.size();
 }
@@ -488,7 +495,18 @@ void FixedRouteLayout::ReleaseColdResources() const {
 
     // Free cold stubs.
     for (void* raw : cold_stubs_) {
-        delete static_cast<ColdStub*>(raw);
+        auto* stub = static_cast<ColdStub*>(raw);
+        auto* parent = stub->parent_ptr;
+        if (parent != nullptr && !parent->isleaf()) {
+            auto* internode = static_cast<MasstreeWrapper::internode_type*>(parent);
+            for (int i = 0; i <= internode->size(); ++i) {
+                if (internode->child_[i] == stub) {
+                    internode->child_[i] = nullptr;
+                    break;
+                }
+            }
+        }
+        delete stub;
     }
     cold_stubs_.clear();
     cold_stubs_.shrink_to_fit();

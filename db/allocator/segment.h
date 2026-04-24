@@ -355,6 +355,14 @@ public:
     {
         return bitmap_.IsFull();
     }
+    size_t DebugBitmapFreeListCapacityBytes() const
+    {
+        return bitmap_.freed_bits_.capacity() * sizeof(size_t);
+    }
+    size_t DebugBitmapArrayBytes() const
+    {
+        return bitmap_.SizeInByte() * 2;
+    }
     void PersistBitmapSoft()
     {
         std::lock_guard<SpinLock> lk(write_delete_locks[segment_id_ % 1024]);

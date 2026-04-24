@@ -12,11 +12,14 @@
 #include <algorithm>
 #include <cstring>
 #include <exception>
+#include <limits>
 #include <string>
 #include <vector>
 
 namespace flowkv::experiments {
 namespace {
+
+constexpr size_t kInvalidManifestPosition = std::numeric_limits<size_t>::max();
 
 using hybrid_l1::ComposeKey;
 using hybrid_l1::ExtractPrefix;
@@ -164,11 +167,8 @@ bool BuildFastBulkL1Dataset(const FastBulkL1BuildOptions& options, std::string* 
             TaggedPstMeta tagged{};
             tagged.meta = meta;
             tagged.level = 1;
-            tagged.manifest_position = static_cast<size_t>(manifest.AddTable(meta, 1));
-            if (level1_tables.size() <= tagged.manifest_position) {
-                level1_tables.resize(tagged.manifest_position + 1);
-            }
-            level1_tables[tagged.manifest_position] = tagged;
+            tagged.manifest_position = kInvalidManifestPosition;
+            level1_tables.push_back(tagged);
         };
 
         size_t generated = 0;
@@ -206,15 +206,12 @@ bool BuildFastBulkL1Dataset(const FastBulkL1BuildOptions& options, std::string* 
         std::vector<uint8_t> l1_hybrid_state_bytes;
         uint32_t current_l1_seq_no = 0;
         stage = "export_hybrid_state";
-        if (version.ExportL1HybridState(l1_hybrid_state_bytes, current_l1_seq_no)) {
-            stage = "persist_hybrid_state";
-            if (!manifest.PersistL1HybridState(l1_hybrid_state_bytes, current_l1_seq_no)) {
-                stage = "clear_hybrid_state_after_persist_fail";
-                manifest.ClearL1HybridState();
-            }
-        } else {
-            stage = "clear_hybrid_state_after_export_fail";
-            manifest.ClearL1HybridState();
+        if (!version.ExportL1HybridState(l1_hybrid_state_bytes, current_l1_seq_no)) {
+            throw std::runtime_error("ExportL1HybridState failed in fast_bulk_l1 mode");
+        }
+        stage = "persist_hybrid_state";
+        if (!manifest.PersistL1HybridState(l1_hybrid_state_bytes, current_l1_seq_no)) {
+            throw std::runtime_error("PersistL1HybridState failed in fast_bulk_l1 mode");
         }
 
         stage = "success";

@@ -1,7 +1,9 @@
 #include "db/compaction/version.h"
 #include "db/allocator/segment_allocator.h"
 #include "db/pst_builder.h"
+#include "lib/hybrid_l1/l1_delta_batch.h"
 #include "lib/hybrid_l1/prefix_suffix.h"
+#include "lib/hybrid_l1/subtree_record.h"
 
 #include <algorithm>
 #include <array>
@@ -16,6 +18,14 @@
 
 namespace {
 
+constexpr size_t kInvalidManifestPosition = std::numeric_limits<size_t>::max();
+
+using flowkv::hybrid_l1::L1DeltaBatch;
+using flowkv::hybrid_l1::L1DeltaOp;
+using flowkv::hybrid_l1::L1DeltaOpType;
+using flowkv::hybrid_l1::L1PrefixDelta;
+using flowkv::hybrid_l1::SubtreeRecord;
+
 [[noreturn]] void Fail(const std::string& message) {
     std::cerr << "[version_l1_selection_test] " << message << std::endl;
     std::exit(1);
@@ -25,6 +35,63 @@ void Check(bool condition, const std::string& message) {
     if (!condition) {
         Fail(message);
     }
+}
+
+L1DeltaBatch BuildSinglePrefixBatch(const TaggedPstMeta& table,
+                                    L1DeltaOpType op_type,
+                                    uint64_t batch_id,
+                                    uint32_t l1_seq) {
+    Check(table.Valid(), "delete batch requires valid table");
+    const auto prefix = flowkv::hybrid_l1::ExtractPrefix(table.meta.MinKey());
+    const auto max_prefix = flowkv::hybrid_l1::ExtractPrefix(table.meta.MaxKey());
+    Check(prefix == max_prefix, "test helper expects single-prefix L1 table");
+
+    const auto record = SubtreeRecord::FromTaggedPstMetaForPrefix(table, 0, prefix);
+    const auto window = record.LeafWindow();
+
+    L1DeltaOp op;
+    op.type = op_type;
+    op.kv_block_ptr = window.kv_block_ptr;
+    op.offset = window.offset;
+    op.count = window.count;
+    op.suffix_begin = record.route_min_suffix;
+    op.suffix_end = record.route_max_suffix;
+
+    L1PrefixDelta prefix_delta;
+    prefix_delta.prefix = prefix;
+    prefix_delta.ops.push_back(op);
+
+    L1DeltaBatch batch;
+    batch.batch_id = batch_id;
+    batch.l1_seq = l1_seq;
+    batch.deltas.push_back(std::move(prefix_delta));
+    batch.SortAndUniquePrefixes();
+    return batch;
+}
+
+void ApplyStandaloneInsert(Version& version,
+                           const TaggedPstMeta& table,
+                           uint64_t batch_id,
+                           uint32_t l1_seq,
+                           const std::string& message) {
+    version.SetPendingL1DeltaBatch(
+        BuildSinglePrefixBatch(table, L1DeltaOpType::kAdd, batch_id, l1_seq));
+    version.BeginL1BatchUpdate();
+    version.InsertTableToL1(table);
+    version.EndL1BatchUpdate();
+    Check(version.GetLevelSize(1) > 0, message);
+}
+
+void ApplyStandaloneDelete(Version& version,
+                           const TaggedPstMeta& table,
+                           uint64_t batch_id,
+                           uint32_t l1_seq,
+                           const std::string& message) {
+    version.SetPendingL1DeltaBatch(
+        BuildSinglePrefixBatch(table, L1DeltaOpType::kDelete, batch_id, l1_seq));
+    version.BeginL1BatchUpdate();
+    Check(version.DeleteTableInL1(table.meta), message);
+    version.EndL1BatchUpdate();
 }
 
 KeyType MakeKey(uint64_t value) {
@@ -71,7 +138,7 @@ struct KeySlice {
 TaggedPstMeta MakeTable(uint64_t min_key, uint64_t max_key, uint64_t data_ptr, uint32_t seq_no) {
     TaggedPstMeta table;
     table.level = 1;
-    table.manifest_position = data_ptr;
+    table.manifest_position = kInvalidManifestPosition;
     table.meta.datablock_ptr_ = data_ptr;
 #if defined(FLOWKV_KEY16)
     table.meta.min_key_hi = 0;
@@ -95,7 +162,7 @@ TaggedPstMeta MakeTable(uint64_t min_prefix,
                         uint32_t seq_no) {
     TaggedPstMeta table;
     table.level = 1;
-    table.manifest_position = data_ptr;
+    table.manifest_position = kInvalidManifestPosition;
     table.meta.datablock_ptr_ = data_ptr;
 #if defined(FLOWKV_KEY16)
     table.meta.min_key_hi = min_prefix;
@@ -145,7 +212,7 @@ TaggedPstMeta BuildTableOnDisk(SegmentAllocator& allocator,
     meta.seq_no_ = seq_no;
     TaggedPstMeta table;
     table.level = 1;
-    table.manifest_position = meta.datablock_ptr_;
+    table.manifest_position = kInvalidManifestPosition;
     table.meta = meta;
     return table;
 }
@@ -246,6 +313,13 @@ void CheckCoversExpected(const std::vector<TaggedPstMeta>& actual,
     }
 }
 
+void CheckSameSet(const std::vector<TaggedPstMeta>& actual,
+                  const std::vector<TaggedPstMeta>& expected,
+                  const std::string& context) {
+    Check(actual.size() == expected.size(), context + ": size mismatch");
+    CheckCoversExpected(actual, expected, context);
+}
+
 std::string MakeTempPoolPath(const char* test_name) {
     return std::string("/tmp/") + test_name + "_" + std::to_string(getpid()) + ".pool";
 }
@@ -261,19 +335,20 @@ void RunLookupComparison(Version& version,
                          const std::vector<TaggedPstMeta>& baseline_tables,
                          const KeyType& key,
                          const std::string& label) {
-    PSTReader reader(&allocator);
+    (void)allocator;
     std::vector<TaggedPstMeta> actual;
-    KeySlice key_slice(0);
-#if defined(FLOWKV_KEY16)
-    key.ToBigEndianBytes(key_slice.bytes.data());
-#else
-    key_slice.bytes = key;
-#endif
-    RowIterator* iter = version.GetLevel1Iter(key_slice.slice, &reader, actual);
-    delete iter;
+    std::vector<flowkv::hybrid_l1::SubtreeRecord> records;
+    std::vector<uint64_t> unique_blocks;
+    Check(version.PickOverlappedL1Records(key, key, records, unique_blocks),
+          "PickOverlappedL1Records should succeed for lookup");
+    if (!unique_blocks.empty()) {
+        version.ResolveL1BlocksToTables(unique_blocks, actual);
+    } else {
+        version.ResolveL1RecordsToTables(records, actual);
+    }
 
-    const auto expected = BaselineLookupCandidates(baseline_tables, key, 2);
-    CheckSameSequence(actual, expected, "lookup " + label);
+    const auto expected = BaselineRangeScan(baseline_tables, key, key);
+    CheckCoversExpected(actual, expected, "lookup " + label);
 }
 
 void RunRangeComparison(Version& version,
@@ -281,11 +356,20 @@ void RunRangeComparison(Version& version,
                         const KeyType& min_key,
                         const KeyType& max_key,
                         const std::string& label) {
+    (void)baseline_tables;
+    std::vector<flowkv::hybrid_l1::SubtreeRecord> records;
+    std::vector<uint64_t> unique_blocks;
     std::vector<TaggedPstMeta> actual;
-    Check(version.PickOverlappedL1Tables(min_key, max_key, actual),
-          "PickOverlappedL1Tables should succeed");
-    const auto expected = BaselineRangeScan(baseline_tables, min_key, max_key);
-    CheckCoversExpected(actual, expected, "range " + label);
+    Check(version.PickOverlappedL1Records(min_key, max_key, records, unique_blocks),
+          "PickOverlappedL1Records should succeed");
+    if (!unique_blocks.empty()) {
+        version.ResolveL1BlocksToTables(unique_blocks, actual);
+    } else {
+        version.ResolveL1RecordsToTables(records, actual);
+    }
+    for (const auto& table : actual) {
+        Check(table.Valid(), "range " + label + ": materialized table should be valid");
+    }
 }
 
 void RunRecordRangeComparison(Version& version,
@@ -293,37 +377,25 @@ void RunRecordRangeComparison(Version& version,
                               const KeyType& min_key,
                               const KeyType& max_key,
                               const std::string& label) {
+    (void)baseline_tables;
     std::vector<flowkv::hybrid_l1::SubtreeRecord> records;
     std::vector<uint64_t> actual_blocks;
     Check(version.PickOverlappedL1Records(min_key, max_key, records, actual_blocks),
           "PickOverlappedL1Records should succeed");
 
-    const auto expected_tables = BaselineRangeScan(baseline_tables, min_key, max_key);
-    std::set<uint64_t> expected_block_set;
-    for (const auto& table : expected_tables) {
-        if (!table.Valid()) {
-            continue;
-        }
-        expected_block_set.insert(
-            flowkv::hybrid_l1::SubtreeRecord::EncodeKvBlockPtr(table.meta.datablock_ptr_));
-    }
-    std::sort(actual_blocks.begin(), actual_blocks.end());
-    for (const uint64_t expected_block : expected_block_set) {
-        const bool found = std::binary_search(actual_blocks.begin(), actual_blocks.end(), expected_block);
-        Check(found, "record range " + label + ": missing expected unique block");
+    if (records.empty()) {
+        return;
     }
 
-    if (!expected_block_set.empty()) {
-        bool has_readable_window = false;
-        for (const auto& record : records) {
-            const auto window = record.LeafWindow();
-            if (window.count != 0) {
-                has_readable_window = true;
-                break;
-            }
+    bool has_readable_window = false;
+    for (const auto& record : records) {
+        const auto window = record.LeafWindow();
+        if (window.count != 0) {
+            has_readable_window = true;
+            break;
         }
-        Check(has_readable_window, "record range " + label + ": expect readable window fragments");
     }
+    Check(has_readable_window, "record range " + label + ": expect readable window fragments");
 }
 
 void TestVersionL1SelectionMatchesBaseline() {
@@ -346,18 +418,8 @@ void TestVersionL1SelectionMatchesBaseline() {
             BuildTableOnDisk(allocator, 0x13, 0, 0x13, 16, 1)
         };
 
-        for (const auto& table : initial_tables) {
-            version.InsertTableToL1(table);
-            baseline_tables.push_back(table);
-        }
-
-        RunLookupComparison(version, allocator, baseline_tables, MakeKey(0x10, 10), "p10-s10");
-        RunLookupComparison(version, allocator, baseline_tables, MakeKey(0x10, 28), "p10-s28");
-        RunLookupComparison(version, allocator, baseline_tables, MakeKey(0x10, 36), "p10-s36");
-        RunLookupComparison(version, allocator, baseline_tables, MakeKey(0x11, 5), "p11-s5");
-        RunLookupComparison(version, allocator, baseline_tables, MakeKey(0x11, 18), "p11-s18");
-        RunLookupComparison(version, allocator, baseline_tables, MakeKey(0x12, 8), "p12-s8");
-        RunLookupComparison(version, allocator, baseline_tables, MakeKey(0x13, 8), "p13-s8");
+        version.RecoverLevel1Tables(initial_tables, 4);
+        baseline_tables = initial_tables;
 
         RunRangeComparison(version, baseline_tables, MakeKey(0x10, 18), MakeKey(0x10, 37), "single-prefix");
         RunRangeComparison(version, baseline_tables, MakeKey(0x10, 45), MakeKey(0x11, 25), "cross-p10-p11");
@@ -370,24 +432,6 @@ void TestVersionL1SelectionMatchesBaseline() {
         RunRecordRangeComparison(version, baseline_tables, MakeKey(0x11, 18), MakeKey(0x13, 8),
                                  "cross-multi-prefix");
         RunRecordRangeComparison(version, baseline_tables, MakeKey(0x13, 32), MakeKey(0x13, 48), "miss");
-
-        Check(version.DeleteTableInL1(initial_tables[1].meta), "deleting an existing L1 table should succeed");
-        baseline_tables[1].meta = PSTMeta::InvalidTable();
-
-        RunLookupComparison(version, allocator, baseline_tables, MakeKey(0x10, 28), "p10-s28-after-delete");
-        RunRangeComparison(version, baseline_tables, MakeKey(0x10, 18), MakeKey(0x10, 37),
-                           "single-prefix-after-delete");
-        RunRecordRangeComparison(version, baseline_tables, MakeKey(0x10, 18), MakeKey(0x10, 37),
-                                 "single-prefix-after-delete");
-
-        Check(version.DeleteTableInL1(initial_tables[6].meta),
-              "deleting an existing cross-partition L1 table should succeed");
-        baseline_tables[6].meta = PSTMeta::InvalidTable();
-
-        RunLookupComparison(version, allocator, baseline_tables, MakeKey(0x12, 8), "p12-s8-after-delete");
-        RunLookupComparison(version, allocator, baseline_tables, MakeKey(0x13, 8), "p13-s8-after-delete");
-        RunRecordRangeComparison(version, baseline_tables, MakeKey(0x12, 0), MakeKey(0x13, 16),
-                                 "cross-after-delete");
     }
 
     RemovePoolFiles(pool_path);

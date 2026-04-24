@@ -51,6 +51,7 @@ public:
                               std::vector<RoutedRoot>& roots) const;
     size_t EstimateRouteIndexMemoryUsageBytes() const;
     size_t EstimateRouteDescriptorIndexMemoryUsageBytes() const;
+    size_t EstimateRouteDescriptorPoolBytes() const;
     size_t ColdStubCount() const;
     size_t EstimateColdSsdBytes() const;
     static RoutePrefix MakeRouteKey(RoutePrefix prefix);

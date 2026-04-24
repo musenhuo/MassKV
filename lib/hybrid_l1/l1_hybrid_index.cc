@@ -587,6 +587,7 @@ L1HybridIndex::MemoryUsageStats L1HybridIndex::EstimateMemoryUsage() const {
     stats.route_hot_descriptor_index_measured_bytes =
         layout_.EstimateRouteDescriptorIndexMemoryUsageBytes();
     stats.route_index_measured_bytes = layout_.EstimateRouteIndexMemoryUsageBytes();
+    stats.route_index_pool_bytes = layout_.EstimateRouteDescriptorPoolBytes();
     stats.route_cold_stub_count = layout_.ColdStubCount();
     stats.route_cold_ssd_bytes = layout_.EstimateColdSsdBytes();
     // governance fields are embedded in RoutePartition and already counted in route_partition_bytes.

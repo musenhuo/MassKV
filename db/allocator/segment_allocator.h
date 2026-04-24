@@ -13,6 +13,27 @@
 class SegmentAllocator
 {
 public:
+    struct ResidentMemoryStats {
+        size_t segment_bitmap_bytes = 0;
+        size_t segment_bitmap_history_bytes = 0;
+        size_t segment_bitmap_freed_bits_capacity_bytes = 0;
+        size_t log_segment_bitmap_bytes = 0;
+        size_t log_segment_bitmap_history_bytes = 0;
+        size_t log_segment_bitmap_freed_bits_capacity_bytes = 0;
+
+        size_t data_segment_cache_count = 0;
+        size_t data_segment_cache_queue_estimated_bytes = 0;
+        size_t data_segment_cache_segment_object_bytes = 0;
+        size_t data_segment_cache_segment_buffer_bytes = 0;
+        size_t data_segment_cache_segment_bitmap_bytes = 0;
+        size_t data_segment_cache_segment_bitmap_freed_bits_capacity_bytes = 0;
+
+        size_t log_segment_group_slot_bytes = 0;
+        size_t log_segment_group_used_entries = 0;
+
+        size_t total_estimated_bytes = 0;
+    };
+
     const std::string& GetPoolPath() const { return pool_path_; }
 
 private:
@@ -338,12 +359,84 @@ public:
     }
 
 
-	void PrintSSDUsage(){
+    void PrintSSDUsage(){
 		size_t used = segment_bitmap_.GetUsedBitsNum();
 		size_t freed = data_segment_cache_.size();
 		size_t usage = (used - freed) * SEGMENT_SIZE;
 		printf("[Segment allocator] SSD usage is %lu MB, inbitmap=%lu,instack=%lu,log=%lu,sort=%lu\n",usage / 1024 /1024,used,freed,log_seg_num_.load(),sort_seg_num_.load());
 	}
+
+    ResidentMemoryStats DebugEstimateResidentMemory() const {
+        ResidentMemoryStats stats;
+
+        stats.segment_bitmap_bytes = segment_bitmap_.SizeInByte();
+        stats.segment_bitmap_history_bytes = segment_bitmap_.SizeInByte();
+        stats.segment_bitmap_freed_bits_capacity_bytes =
+            segment_bitmap_.freed_bits_.capacity() * sizeof(size_t);
+
+        stats.log_segment_bitmap_bytes = log_segment_bitmap_.SizeInByte();
+        stats.log_segment_bitmap_history_bytes = log_segment_bitmap_.SizeInByte();
+        stats.log_segment_bitmap_freed_bits_capacity_bytes =
+            log_segment_bitmap_.freed_bits_.capacity() * sizeof(size_t);
+
+        auto cache_copy = data_segment_cache_;
+        stats.data_segment_cache_count = cache_copy.size();
+        stats.data_segment_cache_queue_estimated_bytes =
+            cache_copy.size() * (sizeof(SortedSegment*) + sizeof(void*) * 2);
+        while (!cache_copy.empty()) {
+            const SortedSegment* seg = cache_copy.front();
+            cache_copy.pop();
+            if (seg == nullptr) {
+                continue;
+            }
+            stats.data_segment_cache_segment_object_bytes += sizeof(SortedSegment);
+            stats.data_segment_cache_segment_buffer_bytes += seg->PAGE_SIZE;
+            stats.data_segment_cache_segment_bitmap_bytes +=
+                seg->DebugBitmapArrayBytes();
+            stats.data_segment_cache_segment_bitmap_freed_bits_capacity_bytes +=
+                seg->DebugBitmapFreeListCapacityBytes();
+        }
+
+        for (int i = 0; i < MAX_MEMTABLE_NUM; ++i) {
+            stats.log_segment_group_slot_bytes +=
+                log_segment_group_[i].debug_capacity() * sizeof(uint64_t);
+            stats.log_segment_group_used_entries +=
+                log_segment_group_[i].debug_size();
+        }
+
+        stats.total_estimated_bytes =
+            stats.segment_bitmap_bytes +
+            stats.segment_bitmap_history_bytes +
+            stats.segment_bitmap_freed_bits_capacity_bytes +
+            stats.log_segment_bitmap_bytes +
+            stats.log_segment_bitmap_history_bytes +
+            stats.log_segment_bitmap_freed_bits_capacity_bytes +
+            stats.data_segment_cache_queue_estimated_bytes +
+            stats.data_segment_cache_segment_object_bytes +
+            stats.data_segment_cache_segment_buffer_bytes +
+            stats.data_segment_cache_segment_bitmap_bytes +
+            stats.data_segment_cache_segment_bitmap_freed_bits_capacity_bytes +
+            stats.log_segment_group_slot_bytes;
+        return stats;
+    }
+
+    size_t DebugReleaseDataSegmentCacheForProbe() {
+        std::lock_guard<SpinLock> lock(mtx_d);
+        size_t released_estimated_bytes = 0;
+        while (!data_segment_cache_.empty()) {
+            SortedSegment* seg = data_segment_cache_.front();
+            data_segment_cache_.pop();
+            if (seg == nullptr) {
+                continue;
+            }
+            released_estimated_bytes += sizeof(SortedSegment);
+            released_estimated_bytes += seg->PAGE_SIZE;
+            released_estimated_bytes += seg->DebugBitmapArrayBytes();
+            released_estimated_bytes += seg->DebugBitmapFreeListCapacityBytes();
+            delete seg;
+        }
+        return released_estimated_bytes;
+    }
 
 
 private:

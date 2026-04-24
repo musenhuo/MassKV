@@ -52,4 +52,14 @@ public:
             list->emplace_back(buf_[i]);
         }
     }
+
+    size_t debug_size() const
+    {
+        return current_.load(std::memory_order_relaxed);
+    }
+
+    size_t debug_capacity() const
+    {
+        return buf_.capacity();
+    }
 };

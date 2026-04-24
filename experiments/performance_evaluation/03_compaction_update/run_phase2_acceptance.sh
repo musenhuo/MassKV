@@ -2,7 +2,7 @@
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
-BUILD_DIR="${1:-$ROOT_DIR/build_phase2_record_only}"
+BUILD_DIR="${1:-$ROOT_DIR/build}"
 RUN_ID="${FLOWKV_PHASE2_ACCEPTANCE_RUN_ID:-phase2_acceptance_$(date -u +%Y%m%d_%H%M%S)}"
 OUT_DIR="$ROOT_DIR/experiments/performance_evaluation/03_compaction_update/results/$RUN_ID"
 LOG_DIR="$OUT_DIR/logs"
@@ -13,12 +13,26 @@ REPORT_MD="$OUT_DIR/PHASE2_ACCEPTANCE.md"
 
 mkdir -p "$LOG_DIR" "$TIME_DIR"
 
+if [[ -f "$BUILD_DIR/CMakeCache.txt" ]]; then
+  cache_root="$(sed -n 's|^CMAKE_HOME_DIRECTORY:INTERNAL=||p' "$BUILD_DIR/CMakeCache.txt" | head -n1)"
+  if [[ -n "$cache_root" && "$cache_root" != "$ROOT_DIR" ]]; then
+    echo "[phase2_acceptance] error: build dir cache belongs to a different source tree"
+    echo "[phase2_acceptance] build_dir=$BUILD_DIR"
+    echo "[phase2_acceptance] cache_root=$cache_root"
+    echo "[phase2_acceptance] expected_root=$ROOT_DIR"
+    echo "[phase2_acceptance] remove the build dir or pass a build dir configured for this repo"
+    exit 2
+  fi
+fi
+
 TARGETS=(
   version_l1_selection_test
   db_l1_route_smoke_test
   db_l1_recovery_smoke_test
   manifest_l1_snapshot_test
   manifest_batch_txn_replay_test
+  manifest_durable_crash_recovery_smoke_test
+  manifest_durable_crash_fuzz_test
 )
 
 echo "[phase2_acceptance] build_dir=$BUILD_DIR"
@@ -47,9 +61,10 @@ run_case() {
 run_case "version_l1_selection_test" "./version_l1_selection_test"
 run_case "db_l1_route_smoke_test" "./db_l1_route_smoke_test"
 run_case "db_l1_recovery_default" "./db_l1_recovery_smoke_test"
-run_case "db_l1_recovery_legacy" "FLOWKV_L1_RANGE_SCAN_RECORDS=0 FLOWKV_L1_MANIFEST_TRACK_TABLES=1 ./db_l1_recovery_smoke_test"
 run_case "manifest_l1_snapshot_test" "./manifest_l1_snapshot_test"
 run_case "manifest_batch_txn_replay_test" "./manifest_batch_txn_replay_test"
+run_case "manifest_durable_crash_recovery_smoke_test" "./manifest_durable_crash_recovery_smoke_test"
+run_case "manifest_durable_crash_fuzz_test" "./manifest_durable_crash_fuzz_test"
 
 echo "case,status,exit_code,max_rss_kb,elapsed_sec,log_file,time_file" > "$SUMMARY_CSV"
 overall_failed=0
@@ -81,24 +96,22 @@ tableless_hit=0
 record_only_hit=0
 record_fallback_hit=0
 tableless_skip_fix_hit=0
-legacy_tableless_hit=0
 
 if [[ "$(cat "$LOG_DIR/version_l1_selection_test.rc")" == "0" ]]; then
   # version_l1_selection_test now includes PickOverlappedL1Records unique-block/window assertions.
   record_only_hit=1
 fi
 grep -q "recover L1 hybrid state(tableless mode)" "$LOG_DIR/db_l1_recovery_default.log" && tableless_hit=1 || true
-grep -q "fallback to table execution" "$LOG_DIR/db_l1_recovery_default.log" && record_fallback_hit=1 || true
+grep -q "fallback to direct table materialization" "$LOG_DIR/db_l1_recovery_default.log" && record_fallback_hit=1 || true
 grep -q "skip L1 manifest consistency fix in tableless snapshot recovery mode" "$LOG_DIR/db_l1_recovery_default.log" && tableless_skip_fix_hit=1 || true
-grep -q "recover L1 hybrid state(tableless mode)" "$LOG_DIR/db_l1_recovery_legacy.log" && legacy_tableless_hit=1 || true
 
 bench_ran=0
 bench_default_status="SKIP"
-bench_legacy_status="SKIP"
+bench_records_disabled_status="SKIP"
 bench_default_throughput=""
-bench_legacy_throughput=""
+bench_records_disabled_throughput=""
 bench_default_rss=""
-bench_legacy_rss=""
+bench_records_disabled_rss=""
 
 if [[ "${FLOWKV_PHASE2_ACCEPTANCE_RUN_BENCH:-0}" == "1" ]]; then
   BENCH_TARGET="write_online_benchmark"
@@ -140,22 +153,22 @@ if [[ "${FLOWKV_PHASE2_ACCEPTANCE_RUN_BENCH:-0}" == "1" ]]; then
 
   bench_ran=1
   run_bench_case "write_online_phase2_default" ""
-  run_bench_case "write_online_phase2_legacy" "FLOWKV_L1_RANGE_SCAN_RECORDS=0 FLOWKV_L1_MANIFEST_TRACK_TABLES=1"
+  run_bench_case "write_online_phase2_records_disabled" "FLOWKV_L1_RANGE_SCAN_RECORDS=0"
 
   bench_default_rc="$(cat "$LOG_DIR/write_online_phase2_default.rc")"
-  bench_legacy_rc="$(cat "$LOG_DIR/write_online_phase2_legacy.rc")"
+  bench_records_disabled_rc="$(cat "$LOG_DIR/write_online_phase2_records_disabled.rc")"
   [[ "$bench_default_rc" == "0" ]] && bench_default_status="PASS" || bench_default_status="FAIL"
-  [[ "$bench_legacy_rc" == "0" ]] && bench_legacy_status="PASS" || bench_legacy_status="FAIL"
+  [[ "$bench_records_disabled_rc" == "0" ]] && bench_records_disabled_status="PASS" || bench_records_disabled_status="FAIL"
 
   bench_default_throughput="$(awk -F= '/^foreground_put_throughput_ops=/{print $2}' "$LOG_DIR/write_online_phase2_default.log" | tail -n1)"
-  bench_legacy_throughput="$(awk -F= '/^foreground_put_throughput_ops=/{print $2}' "$LOG_DIR/write_online_phase2_legacy.log" | tail -n1)"
+  bench_records_disabled_throughput="$(awk -F= '/^foreground_put_throughput_ops=/{print $2}' "$LOG_DIR/write_online_phase2_records_disabled.log" | tail -n1)"
   bench_default_rss="$(awk -F= '/^rss_bytes=/{print $2}' "$LOG_DIR/write_online_phase2_default.log" | tail -n1)"
-  bench_legacy_rss="$(awk -F= '/^rss_bytes=/{print $2}' "$LOG_DIR/write_online_phase2_legacy.log" | tail -n1)"
+  bench_records_disabled_rss="$(awk -F= '/^rss_bytes=/{print $2}' "$LOG_DIR/write_online_phase2_records_disabled.log" | tail -n1)"
 
   {
     echo "case,status,foreground_put_throughput_ops,rss_bytes,log_file,time_file"
     echo "phase2_default,$bench_default_status,${bench_default_throughput:-},${bench_default_rss:-},$LOG_DIR/write_online_phase2_default.log,$TIME_DIR/write_online_phase2_default.time"
-    echo "legacy_fallback,$bench_legacy_status,${bench_legacy_throughput:-},${bench_legacy_rss:-},$LOG_DIR/write_online_phase2_legacy.log,$TIME_DIR/write_online_phase2_legacy.time"
+    echo "records_disabled,$bench_records_disabled_status,${bench_records_disabled_throughput:-},${bench_records_disabled_rss:-},$LOG_DIR/write_online_phase2_records_disabled.log,$TIME_DIR/write_online_phase2_records_disabled.time"
   } > "$BENCH_CSV"
 fi
 
@@ -178,9 +191,8 @@ fi
   echo
   echo "- tableless recovery hit: \`$tableless_hit\`"
   echo "- record-only compaction hit: \`$record_only_hit\`"
-  echo "- record->table fallback hit (expect 0): \`$record_fallback_hit\`"
+  echo "- record->direct-materialization fallback hit (expect 0): \`$record_fallback_hit\`"
   echo "- tableless skip consistency-fix log hit: \`$tableless_skip_fix_hit\`"
-  echo "- legacy mode still tableless hit (expect 0): \`$legacy_tableless_hit\`"
   echo
   if [[ "$bench_ran" == "1" ]]; then
     echo "## Benchmark Compare (optional)"
@@ -188,7 +200,7 @@ fi
     echo "| Mode | Status | Foreground Throughput (ops/s) | RSS Bytes |"
     echo "|---|---:|---:|---:|"
     echo "| phase2_default | $bench_default_status | ${bench_default_throughput:-N/A} | ${bench_default_rss:-N/A} |"
-    echo "| legacy_fallback | $bench_legacy_status | ${bench_legacy_throughput:-N/A} | ${bench_legacy_rss:-N/A} |"
+    echo "| records_disabled | $bench_records_disabled_status | ${bench_records_disabled_throughput:-N/A} | ${bench_records_disabled_rss:-N/A} |"
     echo
     echo "- Raw benchmark csv: \`$BENCH_CSV\`"
     echo

@@ -22,6 +22,7 @@ private:
     const unsigned output_seq_no_;
     bool use_l1_range_scan_records_ = true;
     bool use_l1_delete_covered_only_ = true;
+    bool force_serial_compaction_ = false;
 
     std::vector<std::vector<TaggedPstMeta>> inputs_;
     std::vector<flowkv::hybrid_l1::SubtreeRecord> inputs_l1_records_;
@@ -64,6 +65,7 @@ public:
     bool RunCompaction();
     bool RunSubCompactionParallel();
 	void RunSubCompaction(int partition_id);
+    bool ShouldUseSerialCompaction() const { return force_serial_compaction_; }
 	/**
      * @brief persist data and metadata(manifest) of all output psts, and update L0 and L1 volatile indexes
      * 

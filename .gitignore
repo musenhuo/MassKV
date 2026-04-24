@@ -2,6 +2,16 @@
 build/
 build*/
 test/
+node_modules/
+results_storage/
+collected_results/
+analysis_artifacts/
+reports/
+figures/
+MassKV/
+.agents/
+.codex
+core
 *.d
 *.out
 out.*
@@ -24,3 +34,8 @@ benchmark_pools/*.log
 leafonly*.log
 point_lookup_100m_leafonly_manual_0p10.txt
 故事稿.docx
+
+# Keep root documentation clean. Subdirectory Markdown files are not affected.
+/*.md
+!/README.md
+!/README_CN.md

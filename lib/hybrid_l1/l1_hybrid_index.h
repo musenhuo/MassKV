@@ -55,6 +55,7 @@ public:
         size_t route_partition_bytes = 0;
         size_t route_index_estimated_bytes = 0;
         size_t route_index_measured_bytes = 0;
+        size_t route_index_pool_bytes = 0;
         size_t route_hot_root_index_measured_bytes = 0;
         size_t route_hot_descriptor_index_measured_bytes = 0;
         size_t route_cold_stub_count = 0;

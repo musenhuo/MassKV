@@ -68,8 +68,19 @@ public:
     };
     Iterator *GetIterator(uint64_t data_addr);
 };
+
+struct KeyValueIterator
+{
+    virtual ~KeyValueIterator() = default;
+    virtual KeyType GetCurrentKey() = 0;
+    virtual FixedValue16 GetCurrentValue() = 0;
+    virtual bool NextKey() = 0;
+    virtual bool Valid() = 0;
+    virtual bool MoveTo(const KeyType &key) = 0;
+};
+
 #define NotOverlappedMark 100000
-struct RowIterator
+struct RowIterator : public KeyValueIterator
 {
 public:
     PSTReader *pst_reader_;
@@ -78,6 +89,34 @@ public:
     int current_pst_idx_ = 0;
 
     RowIterator(PSTReader *pst_reader, std::vector<TaggedPstMeta> &pst_list) : pst_reader_(pst_reader), pst_list_(pst_list) {}
+    RowIterator(const RowIterator&) = delete;
+    RowIterator& operator=(const RowIterator&) = delete;
+    RowIterator(RowIterator&& other) noexcept
+        : pst_reader_(other.pst_reader_),
+          pst_iter_(other.pst_iter_),
+          pst_list_(other.pst_list_),
+          current_pst_idx_(other.current_pst_idx_)
+    {
+        other.pst_reader_ = nullptr;
+        other.pst_iter_ = nullptr;
+        other.current_pst_idx_ = 0;
+    }
+    RowIterator& operator=(RowIterator&& other) noexcept
+    {
+        if (this == &other) {
+            return *this;
+        }
+        if (pst_iter_) {
+            delete pst_iter_;
+        }
+        pst_reader_ = other.pst_reader_;
+        pst_iter_ = other.pst_iter_;
+        current_pst_idx_ = other.current_pst_idx_;
+        other.pst_reader_ = nullptr;
+        other.pst_iter_ = nullptr;
+        other.current_pst_idx_ = 0;
+        return *this;
+    }
     ~RowIterator()
     {
         if (pst_iter_)
@@ -107,7 +146,7 @@ public:
         pst_iter_ = pst_reader_->GetIterator(GetPst().meta.datablock_ptr_);
     }
 
-    KeyType GetCurrentKey()
+    KeyType GetCurrentKey() override
     {
         if (pst_iter_)
         {
@@ -116,14 +155,14 @@ public:
         return GetPst().meta.MinKey();
     }
 
-    FixedValue16 GetCurrentValue()
+    FixedValue16 GetCurrentValue() override
     {
         if (!pst_iter_)
             ResetPstIter();
         return pst_iter_->Value();
     }
 
-    bool NextKey()
+    bool NextKey() override
     {
         if (current_pst_idx_ >= pst_list_.size())
             return false;
@@ -138,7 +177,7 @@ public:
         pst_iter_ = nullptr;
         return NextPst();
     }
-    bool Valid()
+    bool Valid() override
     {
         return current_pst_idx_ < pst_list_.size();
     }
@@ -150,7 +189,7 @@ public:
 	 * @return true 
 	 * @return false 
 	 */
-    bool MoveTo(const KeyType &key){
+    bool MoveTo(const KeyType &key) override{
         if(current_pst_idx_ >= pst_list_.size())return false;
         while (KeyTypeLess(pst_list_[current_pst_idx_].meta.MaxKey(), key))
         {

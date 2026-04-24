@@ -5,8 +5,12 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cstdlib>
+#include <fstream>
+#include <iostream>
 #include <limits>
 #include <map>
+#include <string>
 #include <unordered_map>
 #include <unordered_set>
 #include <stdexcept>
@@ -31,9 +35,48 @@ std::atomic<uint64_t> g_tiny_descriptor_count{0};
 std::atomic<uint64_t> g_normal_pack_count{0};
 std::atomic<uint64_t> g_dirty_pack_pages{0};
 std::atomic<uint64_t> g_pack_write_bytes{0};
+std::atomic<uint64_t> g_rebuild_trace_invocation_id{0};
 
 double NsToMs(uint64_t ns) {
     return static_cast<double>(ns) / 1000000.0;
+}
+
+bool L1RebuildTraceEnabled() {
+    const char* env = std::getenv("FLOWKV_L1_REBUILD_TRACE");
+    return env != nullptr && env[0] != '\0' && env[0] != '0';
+}
+
+bool SkipUnsharedCleanupEnabled() {
+    const char* env = std::getenv("FLOWKV_L1_SKIP_UNSHARED_CLEANUP");
+    return env != nullptr && env[0] != '\0' && env[0] != '0';
+}
+
+uint64_t ReadProcessRSSBytes() {
+    std::ifstream status("/proc/self/status");
+    if (!status.is_open()) {
+        return 0;
+    }
+    std::string key;
+    while (status >> key) {
+        if (key == "VmRSS:") {
+            uint64_t kb = 0;
+            std::string unit;
+            status >> kb >> unit;
+            return kb * 1024ULL;
+        }
+        std::string rest_of_line;
+        std::getline(status, rest_of_line);
+    }
+    return 0;
+}
+
+uint64_t CountRecordMapEntries(const std::map<RoutePrefix, std::vector<SubtreeRecord>>& by_prefix) {
+    uint64_t total = 0;
+    for (const auto& [prefix, records] : by_prefix) {
+        (void)prefix;
+        total += records.size();
+    }
+    return total;
 }
 
 template <class Fn>
@@ -58,6 +101,14 @@ size_t CountActiveTables(const std::vector<TaggedPstMeta>& tables) {
         }
     }
     return active;
+}
+
+size_t CountPartitionRecords(const std::vector<RoutePartition>& partitions) {
+    size_t total = 0;
+    for (const auto& partition : partitions) {
+        total += static_cast<size_t>(partition.record_count);
+    }
+    return total;
 }
 
 bool SameFragment(const SubtreeRecord& lhs, const SubtreeRecord& rhs) {
@@ -115,6 +166,38 @@ RoutePrefix ExtractPrefixFromEntry(const PDataBlock::Entry& entry) {
 #endif
 }
 
+uint16_t InferValidEntryCount(const PDataBlock& block) {
+#if defined(FLOWKV_KEY16)
+    Key16 last_key{INVALID_PTR, INVALID_PTR};
+    for (uint16_t i = 0; i < static_cast<uint16_t>(PDataBlock::MAX_ENTRIES); ++i) {
+        const auto& entry = block.entries[i];
+        if (entry.key_hi == INVALID_PTR &&
+            entry.key_lo == INVALID_PTR &&
+            entry.value_lo == INVALID_PTR &&
+            entry.value_hi == INVALID_PTR) {
+            return i;
+        }
+        if (entry.key_hi == last_key.hi && entry.key_lo == last_key.lo) {
+            return i;
+        }
+        last_key = Key16{entry.key_hi, entry.key_lo};
+    }
+#else
+    uint64_t last_key = INVALID_PTR;
+    for (uint16_t i = 0; i < static_cast<uint16_t>(PDataBlock::MAX_ENTRIES); ++i) {
+        const auto& entry = block.entries[i];
+        if (entry.key == INVALID_PTR && entry.value == INVALID_PTR) {
+            return i;
+        }
+        if (entry.key == last_key) {
+            return i;
+        }
+        last_key = entry.key;
+    }
+#endif
+    return static_cast<uint16_t>(PDataBlock::MAX_ENTRIES);
+}
+
 bool BuildPrefixWindowMap(const PDataBlock& block,
                           uint16_t entry_num,
                           PrefixEntryWindowMap& windows_out) {
@@ -142,16 +225,19 @@ bool BuildPrefixWindowMap(const PDataBlock& block,
 }
 
 bool LoadPrefixWindowMap(uint64_t kv_block_ptr,
-                         uint16_t entry_num,
                          SegmentAllocator* segment_allocator,
                          PrefixEntryWindowMap& windows_out) {
-    if (segment_allocator == nullptr || entry_num == 0) {
+    if (segment_allocator == nullptr) {
         return false;
     }
     PDataBlock block{};
     const uint64_t block_off = SubtreeRecord::DecodeKvBlockOffset(kv_block_ptr);
     const ssize_t ret = pread(segment_allocator->Getfd(), &block, sizeof(PDataBlock), block_off);
     if (ret != static_cast<ssize_t>(sizeof(PDataBlock))) {
+        return false;
+    }
+    const uint16_t entry_num = InferValidEntryCount(block);
+    if (entry_num == 0) {
         return false;
     }
     return BuildPrefixWindowMap(block, entry_num, windows_out);
@@ -170,12 +256,11 @@ void RefineRecordLeafWindowForPrefix(
         return;
     }
 
-    const uint64_t cache_key = (leaf_window.kv_block_ptr << 16) | leaf_window.count;
+    const uint64_t cache_key = leaf_window.kv_block_ptr;
     auto cache_it = window_cache.find(cache_key);
     if (cache_it == window_cache.end()) {
         PrefixEntryWindowMap windows;
-        if (!LoadPrefixWindowMap(leaf_window.kv_block_ptr, leaf_window.count,
-                                 segment_allocator, windows)) {
+        if (!LoadPrefixWindowMap(leaf_window.kv_block_ptr, segment_allocator, windows)) {
             return;
         }
         cache_it = window_cache.emplace(cache_key, std::move(windows)).first;
@@ -569,6 +654,16 @@ void L1HybridRebuilder::RebuildPartitionsFromTables(const std::vector<TaggedPstM
     uint64_t local_normal_pack_count = 0;
     uint64_t local_dirty_pack_pages = 0;
     uint64_t local_pack_write_bytes = 0;
+    uint64_t local_cleanup_destroy_unshared_count = 0;
+    uint64_t local_cleanup_destroy_full_count = 0;
+    uint64_t local_cleanup_reclaim_pack_pages = 0;
+    uint64_t local_cleanup_skip_unshared_count = 0;
+    const bool trace_enabled = L1RebuildTraceEnabled();
+    const bool skip_unshared_cleanup = SkipUnsharedCleanupEnabled();
+    const uint64_t trace_invocation_id =
+        g_rebuild_trace_invocation_id.fetch_add(1, std::memory_order_relaxed) + 1;
+    const uint64_t trace_base_rss_bytes = trace_enabled ? ReadProcessRSSBytes() : 0;
+    uint64_t trace_peak_rss_bytes = trace_base_rss_bytes;
 
     if (segment_allocator == nullptr) {
         throw std::invalid_argument(
@@ -617,6 +712,63 @@ void L1HybridRebuilder::RebuildPartitionsFromTables(const std::vector<TaggedPstM
     std::map<RoutePrefix, SubtreePageStoreHandle> new_handles_after_publish;
     std::map<RoutePrefix, std::vector<SubtreeRecord>> pack_records_by_prefix;
     std::map<uint32_t, std::unordered_set<SubtreePagePtr>> old_pack_ptrs_for_cleanup;
+    uint64_t trace_pack_pages_count = 0;
+    uint64_t trace_encoded_pages_count = 0;
+
+    const auto trace_rebuild_stage = [&](const char* stage) {
+        if (!trace_enabled) {
+            return;
+        }
+        const uint64_t rss_bytes = ReadProcessRSSBytes();
+        trace_peak_rss_bytes = std::max(trace_peak_rss_bytes, rss_bytes);
+        const uint64_t rebuilt_record_count = CountRecordMapEntries(rebuilt_records);
+        const uint64_t pack_record_count = CountRecordMapEntries(pack_records_by_prefix);
+        const uint64_t elapsed_ns = static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now() - fn_begin).count());
+        std::cout << "[L1_REBUILD_TRACE]"
+                  << " invocation_id=" << trace_invocation_id
+                  << " stage=" << stage
+                  << " rss_bytes=" << rss_bytes
+                  << " rss_delta_base_bytes="
+                  << static_cast<int64_t>(rss_bytes) - static_cast<int64_t>(trace_base_rss_bytes)
+                  << " peak_rss_bytes=" << trace_peak_rss_bytes
+                  << " elapsed_ms=" << NsToMs(elapsed_ns)
+                  << " changed_prefixes=" << changed_prefixes.size()
+                  << " delta_prefix_candidates=" << delta_by_prefix.size()
+                  << " rebuilt_prefixes=" << rebuilt_records.size()
+                  << " rebuilt_records=" << rebuilt_record_count
+                  << " rebuilt_est_bytes="
+                  << (rebuilt_record_count * static_cast<uint64_t>(sizeof(SubtreeRecord)))
+                  << " pack_prefixes=" << pack_records_by_prefix.size()
+                  << " pack_records=" << pack_record_count
+                  << " pack_est_bytes="
+                  << (pack_record_count * static_cast<uint64_t>(sizeof(SubtreeRecord)))
+                  << " next_partitions=" << next_partitions.size()
+                  << " pack_pages=" << trace_pack_pages_count
+                  << " encoded_pages=" << trace_encoded_pages_count
+                  << " local_delta_prefixes=" << local_delta_prefix_count
+                  << " local_delta_ops=" << local_delta_ops_count
+                  << " local_bulk_prefixes=" << local_bulk_prefix_count
+                  << " local_cow_prefixes=" << local_cow_prefix_count
+                  << " local_fallback_count=" << local_rebuild_fallback_count
+                  << " local_dirty_pack_pages=" << local_dirty_pack_pages
+                  << " local_pack_write_bytes=" << local_pack_write_bytes
+                  << " local_cleanup_destroy_unshared_count="
+                  << local_cleanup_destroy_unshared_count
+                  << " local_cleanup_destroy_full_count="
+                  << local_cleanup_destroy_full_count
+                  << " local_cleanup_reclaim_pack_pages="
+                  << local_cleanup_reclaim_pack_pages
+                  << " local_cleanup_skip_unshared_count="
+                  << local_cleanup_skip_unshared_count
+                  << " skip_unshared_cleanup="
+                  << (skip_unshared_cleanup ? 1 : 0)
+                  << " local_index_update_cow_ms=" << NsToMs(local_index_update_cow_ns)
+                  << " local_index_update_bulk_ms=" << NsToMs(local_index_update_bulk_ns)
+                  << "\n";
+    };
+
+    trace_rebuild_stage("records_built");
 
     const auto collect_pack_records = [&](RoutePrefix prefix,
                                           const std::vector<SubtreeRecord>& records,
@@ -748,6 +900,7 @@ void L1HybridRebuilder::RebuildPartitionsFromTables(const std::vector<TaggedPstM
             next_partitions.push_back(std::move(partition));
         }
     }
+    trace_rebuild_stage("prefix_updates_done");
 
     std::unordered_map<RoutePrefix, size_t> next_partition_index;
     next_partition_index.reserve(next_partitions.size());
@@ -762,6 +915,8 @@ void L1HybridRebuilder::RebuildPartitionsFromTables(const std::vector<TaggedPstM
             throw std::runtime_error("failed to build normal-pack pages");
         }
     }
+    trace_pack_pages_count = static_cast<uint64_t>(pack_pages.size());
+    trace_rebuild_stage("pack_pages_built");
 
     std::vector<SubtreePagePtr> new_pack_page_ptrs;
     if (!pack_pages.empty()) {
@@ -774,6 +929,8 @@ void L1HybridRebuilder::RebuildPartitionsFromTables(const std::vector<TaggedPstM
             }
             encoded_pages.push_back(std::move(bytes));
         }
+        trace_encoded_pages_count = static_cast<uint64_t>(encoded_pages.size());
+        trace_rebuild_stage("pack_pages_encoded");
         new_pack_page_ptrs =
             SubtreePageStore::PersistOpaquePages(*segment_allocator, subtree_page_size, encoded_pages);
         if (new_pack_page_ptrs.size() != pack_pages.size()) {
@@ -784,6 +941,7 @@ void L1HybridRebuilder::RebuildPartitionsFromTables(const std::vector<TaggedPstM
             static_cast<uint64_t>(new_pack_page_ptrs.size()) *
             static_cast<uint64_t>(subtree_page_size);
     }
+    trace_rebuild_stage("pack_pages_persisted");
 
     for (const auto& prefix : changed_prefixes) {
         const auto it_idx = next_partition_index.find(prefix);
@@ -818,13 +976,20 @@ void L1HybridRebuilder::RebuildPartitionsFromTables(const std::vector<TaggedPstM
         ++local_normal_pack_count;
     }
 
+    trace_rebuild_stage("before_cleanup");
     if (segment_allocator != nullptr) {
         for (const auto& [prefix, old_handle] : old_handles_for_cleanup) {
             const auto keep_it = new_handles_after_publish.find(prefix);
             if (keep_it != new_handles_after_publish.end()) {
-                SubtreePageStore::DestroyUnshared(*segment_allocator, old_handle, keep_it->second);
+                if (skip_unshared_cleanup) {
+                    ++local_cleanup_skip_unshared_count;
+                } else {
+                    SubtreePageStore::DestroyUnshared(*segment_allocator, old_handle, keep_it->second);
+                    ++local_cleanup_destroy_unshared_count;
+                }
             } else {
                 SubtreePageStore::Destroy(*segment_allocator, old_handle);
+                ++local_cleanup_destroy_full_count;
             }
         }
         std::map<uint32_t, std::unordered_set<SubtreePagePtr>> keep_pack_ptrs;
@@ -850,12 +1015,21 @@ void L1HybridRebuilder::RebuildPartitionsFromTables(const std::vector<TaggedPstM
                 }
             }
             SubtreePageStore::DestroyOpaquePages(*segment_allocator, page_size, reclaim);
+            local_cleanup_reclaim_pack_pages += static_cast<uint64_t>(reclaim.size());
         }
     }
+    trace_rebuild_stage("after_cleanup");
 
+    trace_rebuild_stage("before_refresh_layout");
     partitions = std::move(next_partitions);
     layout.RefreshPartitions(partitions);
-    size = CountActiveTables(tables);
+    if (delta_batch != nullptr) {
+        size = CountPartitionRecords(partitions);
+    } else {
+        size = CountActiveTables(tables);
+    }
+    trace_rebuild_stage("after_refresh_layout");
+    trace_rebuild_stage("publish_done");
 
     const uint64_t local_index_update_total_ns =
         static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
@@ -874,6 +1048,7 @@ void L1HybridRebuilder::RebuildPartitionsFromTables(const std::vector<TaggedPstM
     g_normal_pack_count.fetch_add(local_normal_pack_count, std::memory_order_relaxed);
     g_dirty_pack_pages.fetch_add(local_dirty_pack_pages, std::memory_order_relaxed);
     g_pack_write_bytes.fetch_add(local_pack_write_bytes, std::memory_order_relaxed);
+    trace_rebuild_stage("function_end");
 }
 
 void L1HybridRebuilder::ValidateSortedRecords(const std::vector<SubtreeRecord>& sorted_records) {

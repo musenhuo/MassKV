@@ -92,6 +92,59 @@ private:
     int workload_detect_sample_ = 0;
 
 public: // TODO: change to private
+    struct EngineResidentMemoryStats
+    {
+        uint64_t l1_route_index_estimated_bytes = 0;
+        uint64_t l1_route_index_measured_bytes = 0;
+        uint64_t l1_route_index_pool_bytes = 0;
+        uint64_t l1_route_partition_bytes = 0;
+        uint64_t l1_subtree_published_bytes = 0;
+        uint64_t l1_subtree_cache_bytes = 0;
+        uint64_t l1_pending_changed_route_keys_bytes = 0;
+        uint64_t l1_pending_delta_estimated_bytes = 0;
+        uint64_t l0_table_lists_total_size = 0;
+        uint64_t l0_table_lists_total_capacity = 0;
+        uint64_t l0_table_lists_total_capacity_bytes = 0;
+        uint64_t l0_tree_index_count = 0;
+        uint64_t l0_tree_index_tree_bytes = 0;
+        uint64_t l0_tree_index_pool_bytes = 0;
+        uint64_t l0_tree_index_total_bytes = 0;
+        uint64_t l1_total_estimated_bytes = 0;
+
+        uint64_t seg_bitmap_bytes = 0;
+        uint64_t seg_bitmap_history_bytes = 0;
+        uint64_t seg_bitmap_freed_bits_capacity_bytes = 0;
+        uint64_t seg_log_bitmap_bytes = 0;
+        uint64_t seg_log_bitmap_history_bytes = 0;
+        uint64_t seg_log_bitmap_freed_bits_capacity_bytes = 0;
+        uint64_t seg_cache_count = 0;
+        uint64_t seg_cache_queue_estimated_bytes = 0;
+        uint64_t seg_cache_segment_object_bytes = 0;
+        uint64_t seg_cache_segment_buffer_bytes = 0;
+        uint64_t seg_cache_segment_bitmap_bytes = 0;
+        uint64_t seg_cache_segment_bitmap_freed_bits_capacity_bytes = 0;
+        uint64_t seg_log_group_slot_bytes = 0;
+        uint64_t seg_total_estimated_bytes = 0;
+
+        uint64_t manifest_super_buffer_bytes = 0;
+        uint64_t manifest_super_meta_bytes = 0;
+        uint64_t manifest_batch_super_meta_bytes = 0;
+        uint64_t manifest_l0_freelist_estimated_bytes = 0;
+        uint64_t manifest_batch_pages_count = 0;
+        uint64_t manifest_batch_pages_data_bytes = 0;
+        uint64_t manifest_batch_pages_map_node_estimated_bytes = 0;
+        uint64_t manifest_batch_pages_map_bucket_bytes = 0;
+        uint64_t manifest_total_estimated_bytes = 0;
+
+        uint64_t memtable_masstree_active_count = 0;
+        uint64_t memtable_masstree_tree_bytes = 0;
+        uint64_t memtable_masstree_pool_bytes = 0;
+        uint64_t memtable_masstree_total_bytes = 0;
+
+        uint64_t db_core_fixed_estimated_bytes = 0;
+        uint64_t total_known_resident_estimated_bytes = 0;
+    };
+
     // BufferStore (level 0) + LeveledStore (Level 1 and level 2)
     Version *current_version_;
     Manifest *manifest_;
@@ -208,8 +261,15 @@ public: // TODO: change to private
 	/** @brief 获取 DataBlock 缓存命中率统计 */
 	void PrintCacheStats();
 	
-	/** @brief 打印 L1 索引统计信息 */
+    /** @brief 打印 L1 索引统计信息 */
 	void PrintL1IndexStats();
+    EngineResidentMemoryStats DebugEstimateEngineResidentMemory() const;
+    size_t DebugReleaseLevel0TableListCapacityForProbe();
+    size_t DebugReleaseSegmentCacheForProbe();
+    size_t DebugReleaseAllLevel1ForProbe();
+    size_t DebugReleaseManifestStateForProbe();
+    size_t DebugReleaseActiveMemtableForProbe();
+    size_t DebugReleaseThreadPoolsForProbe();
 	
 	// Get 操作统计（全局）
 	static std::atomic<uint64_t> global_get_success_;

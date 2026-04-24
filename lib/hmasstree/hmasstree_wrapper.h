@@ -310,6 +310,11 @@ public:
     {
         // printf("before free ti\n");
         // print_dram_consuption();
+        if (tis[0] != nullptr) {
+            // Ensure tree nodes (and their ksuffix malloc allocations) enter
+            // the reclaim path before threadinfo pools are released.
+            table_.destroy(*tis[0]);
+        }
         for (int i = 0; i < 65; i++)
         {
             if (tis[i] != nullptr)

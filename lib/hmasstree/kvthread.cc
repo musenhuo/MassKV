@@ -72,6 +72,41 @@ threadinfo *threadinfo::make(int purpose, int index) {
 }
 
 void threadinfo::free_ti(threadinfo* ti){
+    // Unlink from global thread list first, so no future traversal sees freed nodes.
+    if (allthreads == ti) {
+        allthreads = ti->next_;
+    } else {
+        for (threadinfo* cur = allthreads; cur != nullptr; cur = cur->next_) {
+            if (cur->next_ == ti) {
+                cur->next_ = ti->next_;
+                break;
+            }
+        }
+    }
+
+    // Drain all pending RCU payloads/callbacks before releasing limbo groups.
+    // This is required to reclaim malloc-backed objects (e.g., ksuffix buffers)
+    // that are otherwise only reachable through deferred callbacks.
+    bool drained_any = true;
+    while (drained_any) {
+        drained_any = false;
+        for (limbo_group* lg = ti->limbo_head_; lg != nullptr; lg = lg->next_) {
+            unsigned idx = lg->head_;
+            while (idx < lg->tail_) {
+                if (lg->e_[idx].ptr_ != nullptr) {
+                    void* ptr = lg->e_[idx].ptr_;
+                    const memtag tag = lg->e_[idx].u_.tag;
+                    lg->e_[idx].ptr_ = nullptr;
+                    ti->free_rcu(ptr, tag);
+                    drained_any = true;
+                }
+                ++idx;
+            }
+            lg->head_ = 0;
+            lg->tail_ = 0;
+        }
+    }
+
     auto limbo_ptr = ti->limbo_head_;
     while (limbo_ptr)
     {

@@ -33,9 +33,15 @@ public:
     }
     ~BitMap()
     {
-        // std::vector<uint64_t>().swap(freed_bits_);
-        // free(bitmap_);
-        // free(history_bitmap_);
+        std::vector<size_t>().swap(freed_bits_);
+        if (bitmap_ != nullptr) {
+            free(bitmap_);
+            bitmap_ = nullptr;
+        }
+        if (history_bitmap_ != nullptr) {
+            free(history_bitmap_);
+            history_bitmap_ = nullptr;
+        }
     }
     void Setoff(off_t off_) { 
         off = off_; 
@@ -85,7 +91,7 @@ public:
         Recover();
         off = temp;
     }
-    inline size_t SizeInByte()
+    inline size_t SizeInByte() const
     {
         return roundup(total_bit_num_, 4 * 1024 * 8) / 8;
     }

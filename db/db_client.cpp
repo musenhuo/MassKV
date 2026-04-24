@@ -245,8 +245,7 @@ int MYDBClient::Scan(const Slice start_key, int scan_sz, std::vector<KeyType> &k
         if (db_->mem_index_[memidx] != nullptr)
             db_->mem_index_[memidx]->Scan2(scan_start_key, scan_sz, keys_mem[i], values_mem[i]);
     }
-    std::vector<TaggedPstMeta> table_metas;
-    RowIterator *level_row = db_->current_version_->GetLevel1Iter(start_key, pst_reader_, table_metas);
+    KeyValueIterator *level_row = db_->current_version_->GetLevel1Iter(start_key, pst_reader_);
 #if defined(FLOWKV_KEY16)
     KeyType int_start_key = start_key.ToKey16();
     LOG("level row.valid=%d, current_key=%lu:%lu\n", level_row->Valid(), level_row->GetCurrentKey().hi, level_row->GetCurrentKey().lo);

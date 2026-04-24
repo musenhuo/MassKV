@@ -16,10 +16,14 @@
 #include <iterator>
 #include <iostream>
 #include <numeric>
+#include <cstdio>
 #include <string>
 #include <thread>
 #include <vector>
 #include <unistd.h>
+#if defined(__GLIBC__)
+#include <malloc.h>
+#endif
 
 namespace {
 
@@ -56,6 +60,16 @@ struct Config {
     size_t compaction_threads = 0; // 0 means auto-tune by writer threads
     bool use_direct_io = true;
     bool keep_db_files = false;
+    bool trace_manual_phases = false;
+    bool trace_l1_resident = false;
+    bool trace_allocator = false;
+    bool dump_malloc_info = false;
+    std::string allocator_dump_dir;
+    bool rss_trim_probe = false;
+    bool unbuffered_stdout = false;
+    bool probe_release_components = false;
+    bool collect_put_latencies = true;
+    bool trace_batch_events = true;
 };
 
 struct WriteMetrics {
@@ -85,8 +99,60 @@ struct WriteMetrics {
     uint64_t rss_before_drain_wait_bytes = 0;
     uint64_t rss_after_drain_wait_bytes = 0;
     int64_t rss_drain_wait_delta_bytes = 0;
+    uint64_t rss_after_malloc_trim_bytes = 0;
+    int64_t rss_malloc_trim_delta_bytes = 0;
+    uint64_t alloc_arena_bytes = 0;
+    uint64_t alloc_hblkhd_bytes = 0;
+    uint64_t alloc_uordblks_bytes = 0;
+    uint64_t alloc_fordblks_bytes = 0;
+    uint64_t alloc_keepcost_bytes = 0;
+    uint64_t alloc_total_system_bytes = 0;
+    uint64_t alloc_total_inuse_estimated_bytes = 0;
+    uint64_t alloc_total_free_estimated_bytes = 0;
+    uint64_t alloc_supported = 0;
+    uint64_t alloc_backend = 0;
+    uint64_t alloc_jemalloc_stats_valid = 0;
+    uint64_t alloc_jemalloc_allocated_bytes = 0;
+    uint64_t alloc_jemalloc_active_bytes = 0;
+    uint64_t alloc_jemalloc_resident_bytes = 0;
+    uint64_t alloc_jemalloc_mapped_bytes = 0;
+    uint64_t alloc_jemalloc_retained_bytes = 0;
 
+    size_t l1_route_index_estimated_bytes = 0;
     size_t l1_route_index_measured_bytes = 0;
+    size_t l1_route_partition_bytes = 0;
+    size_t l1_subtree_published_bytes = 0;
+    size_t l1_pending_changed_route_keys_bytes = 0;
+    size_t l1_pending_delta_estimated_bytes = 0;
+    uint64_t l0_tree_index_count = 0;
+    uint64_t l0_tree_index_tree_bytes = 0;
+    uint64_t l0_tree_index_pool_bytes = 0;
+    uint64_t l0_tree_index_total_bytes = 0;
+    uint64_t l1_resident_total_estimated_bytes = 0;
+    uint64_t seg_bitmap_bytes = 0;
+    uint64_t seg_bitmap_history_bytes = 0;
+    uint64_t seg_bitmap_freed_bits_capacity_bytes = 0;
+    uint64_t seg_log_bitmap_bytes = 0;
+    uint64_t seg_log_bitmap_history_bytes = 0;
+    uint64_t seg_log_bitmap_freed_bits_capacity_bytes = 0;
+    uint64_t seg_cache_count = 0;
+    uint64_t seg_cache_queue_estimated_bytes = 0;
+    uint64_t seg_cache_segment_object_bytes = 0;
+    uint64_t seg_cache_segment_buffer_bytes = 0;
+    uint64_t seg_cache_segment_bitmap_bytes = 0;
+    uint64_t seg_log_group_slot_bytes = 0;
+    uint64_t seg_total_estimated_bytes = 0;
+    uint64_t manifest_super_buffer_bytes = 0;
+    uint64_t manifest_super_meta_bytes = 0;
+    uint64_t manifest_batch_super_meta_bytes = 0;
+    uint64_t manifest_l0_freelist_estimated_bytes = 0;
+    uint64_t manifest_batch_pages_data_bytes = 0;
+    uint64_t manifest_batch_pages_map_node_estimated_bytes = 0;
+    uint64_t manifest_batch_pages_map_bucket_bytes = 0;
+    uint64_t manifest_total_estimated_bytes = 0;
+    uint64_t db_core_fixed_estimated_bytes = 0;
+    uint64_t total_known_resident_estimated_bytes = 0;
+
     uint64_t l1_active_pst_count = 0;
     uint64_t l0_tree_count_after_drain = 0;
     size_t l1_subtree_cache_bytes = 0;
@@ -173,6 +239,311 @@ bool ParseBoolFlag(const std::string& text) {
     Fail("invalid bool flag value: " + text + ", expected 0/1/true/false");
 }
 
+extern "C" int mallctl(const char* name,
+                       void* oldp,
+                       size_t* oldlenp,
+                       void* newp,
+                       size_t newlen) __attribute__((weak));
+
+enum class AllocatorBackend : uint64_t {
+    kUnknown = 0,
+    kGlibcMallinfo2 = 1,
+    kJemallocMallctl = 2,
+};
+
+const char* AllocatorBackendToken(AllocatorBackend backend) {
+    switch (backend) {
+        case AllocatorBackend::kGlibcMallinfo2:
+            return "glibc_mallinfo2";
+        case AllocatorBackend::kJemallocMallctl:
+            return "jemalloc_mallctl";
+        case AllocatorBackend::kUnknown:
+        default:
+            return "unknown";
+    }
+}
+
+struct AllocatorSnapshot {
+    bool supported = false;
+    AllocatorBackend backend = AllocatorBackend::kUnknown;
+    uint64_t arena_bytes = 0;
+    uint64_t hblkhd_bytes = 0;
+    uint64_t uordblks_bytes = 0;
+    uint64_t fordblks_bytes = 0;
+    uint64_t keepcost_bytes = 0;
+    uint64_t total_system_bytes = 0;
+    uint64_t total_inuse_estimated_bytes = 0;
+    uint64_t total_free_estimated_bytes = 0;
+
+    bool jemalloc_stats_valid = false;
+    uint64_t jemalloc_allocated_bytes = 0;
+    uint64_t jemalloc_active_bytes = 0;
+    uint64_t jemalloc_resident_bytes = 0;
+    uint64_t jemalloc_mapped_bytes = 0;
+    uint64_t jemalloc_retained_bytes = 0;
+};
+
+bool CaptureJemallocSnapshot(AllocatorSnapshot* snap) {
+    if (snap == nullptr || mallctl == nullptr) {
+        return false;
+    }
+
+    uint64_t epoch = 1;
+    size_t epoch_sz = sizeof(epoch);
+    if (mallctl("epoch", &epoch, &epoch_sz, &epoch, epoch_sz) != 0) {
+        return false;
+    }
+
+    auto read_stat = [](const char* key, uint64_t* out) -> bool {
+        size_t value = 0;
+        size_t sz = sizeof(value);
+        if (mallctl(key, &value, &sz, nullptr, 0) != 0) {
+            return false;
+        }
+        if (out != nullptr) {
+            *out = static_cast<uint64_t>(value);
+        }
+        return true;
+    };
+
+    uint64_t allocated = 0;
+    uint64_t active = 0;
+    uint64_t resident = 0;
+    uint64_t mapped = 0;
+    if (!read_stat("stats.allocated", &allocated) ||
+        !read_stat("stats.active", &active) ||
+        !read_stat("stats.resident", &resident) ||
+        !read_stat("stats.mapped", &mapped)) {
+        return false;
+    }
+    uint64_t retained = 0;
+    (void)read_stat("stats.retained", &retained);
+
+    snap->supported = true;
+    snap->backend = AllocatorBackend::kJemallocMallctl;
+    snap->jemalloc_stats_valid = true;
+    snap->jemalloc_allocated_bytes = allocated;
+    snap->jemalloc_active_bytes = active;
+    snap->jemalloc_resident_bytes = resident;
+    snap->jemalloc_mapped_bytes = mapped;
+    snap->jemalloc_retained_bytes = retained;
+
+    // Compatibility mapping for existing residual calculations:
+    // in-use ~= allocated, free-retained ~= active - allocated.
+    snap->uordblks_bytes = allocated;
+    snap->hblkhd_bytes = 0;
+    snap->arena_bytes = active;
+    snap->fordblks_bytes = active > allocated ? (active - allocated) : 0;
+    snap->keepcost_bytes = 0;
+    snap->total_inuse_estimated_bytes = allocated;
+    snap->total_free_estimated_bytes = snap->fordblks_bytes;
+    snap->total_system_bytes = mapped;
+    return true;
+}
+
+AllocatorSnapshot CaptureAllocatorSnapshot() {
+    AllocatorSnapshot snap;
+    if (CaptureJemallocSnapshot(&snap)) {
+        return snap;
+    }
+#if defined(__GLIBC__)
+    const auto mi = mallinfo2();
+    snap.supported = true;
+    snap.backend = AllocatorBackend::kGlibcMallinfo2;
+    snap.arena_bytes = static_cast<uint64_t>(mi.arena);
+    snap.hblkhd_bytes = static_cast<uint64_t>(mi.hblkhd);
+    snap.uordblks_bytes = static_cast<uint64_t>(mi.uordblks);
+    snap.fordblks_bytes = static_cast<uint64_t>(mi.fordblks);
+    snap.keepcost_bytes = static_cast<uint64_t>(mi.keepcost);
+    snap.total_system_bytes = snap.arena_bytes + snap.hblkhd_bytes;
+    snap.total_inuse_estimated_bytes = snap.uordblks_bytes + snap.hblkhd_bytes;
+    snap.total_free_estimated_bytes = snap.fordblks_bytes;
+#endif
+    return snap;
+}
+
+int DumpMallocInfoSnapshot(const std::filesystem::path& path) {
+#if defined(__GLIBC__)
+    std::error_code ec;
+    std::filesystem::create_directories(path.parent_path(), ec);
+    FILE* fp = std::fopen(path.c_str(), "w");
+    if (fp == nullptr) {
+        return -2;
+    }
+    const int ret = malloc_info(0, fp);
+    std::fclose(fp);
+    return ret;
+#else
+    (void)path;
+    return -3;
+#endif
+}
+
+size_t GetProcessRSSBytes();
+
+void EmitProcessOnlyResidentSnapshot(const Config& cfg,
+                                     const std::string& event,
+                                     const std::chrono::steady_clock::time_point& total_begin,
+                                     size_t batch_idx,
+                                     uint64_t* malloc_info_snapshot_seq) {
+    if (!cfg.trace_manual_phases ||
+        (!cfg.trace_l1_resident && !cfg.trace_allocator && !cfg.dump_malloc_info)) {
+        return;
+    }
+
+    const auto now = std::chrono::steady_clock::now();
+    const double elapsed_ms =
+        static_cast<double>(
+            std::chrono::duration_cast<std::chrono::microseconds>(now - total_begin).count()) /
+        1000.0;
+    const uint64_t rss_bytes = static_cast<uint64_t>(GetProcessRSSBytes());
+    const auto alloc_before = CaptureAllocatorSnapshot();
+    auto alloc_after = alloc_before;
+    uint64_t rss_after_trim = rss_bytes;
+    int64_t rss_trim_delta = 0;
+    int trim_result = -1;
+    std::string malloc_info_file = "-";
+    int malloc_info_result = -1;
+#if defined(__GLIBC__)
+    if (cfg.rss_trim_probe) {
+        trim_result = malloc_trim(0);
+        rss_after_trim = static_cast<uint64_t>(GetProcessRSSBytes());
+        rss_trim_delta = static_cast<int64_t>(rss_after_trim) - static_cast<int64_t>(rss_bytes);
+        alloc_after = CaptureAllocatorSnapshot();
+    }
+#endif
+    if (cfg.dump_malloc_info) {
+        const auto file_name = "malloc_info_" + std::to_string(++(*malloc_info_snapshot_seq)) +
+                               "_" + event + ".xml";
+        const auto dump_path = std::filesystem::path(cfg.allocator_dump_dir) / file_name;
+        malloc_info_result = DumpMallocInfoSnapshot(dump_path);
+        malloc_info_file = dump_path.string();
+    }
+
+    std::cout << "[MANUAL_TRACE]"
+              << " t_ms=" << elapsed_ms
+              << " event=" << event
+              << " batch_idx=" << batch_idx
+              << " logical_begin=" << cfg.write_ops
+              << " logical_end=" << cfg.write_ops
+              << " phase_time_ms=0"
+              << " compacted=1"
+              << " rss_bytes=" << rss_bytes
+              << " l0_tree_num=0"
+              << " l1_active_pst_count=0"
+              << "\n";
+
+    std::cout << "[MANUAL_L1_RESIDENT]"
+              << " event=" << event
+              << " rss_bytes=" << rss_bytes
+              << " l1_route_index_estimated_bytes=0"
+              << " l1_route_index_measured_bytes=0"
+              << " l1_route_index_pool_bytes=0"
+              << " l1_route_partition_bytes=0"
+              << " l1_subtree_published_bytes=0"
+              << " l1_subtree_cache_bytes=0"
+              << " l1_pending_changed_route_keys_bytes=0"
+              << " l1_pending_delta_estimated_bytes=0"
+              << " l0_table_lists_total_size=0"
+              << " l0_table_lists_total_capacity=0"
+              << " l0_table_lists_total_capacity_bytes=0"
+              << " l0_tree_index_count=0"
+              << " l0_tree_index_tree_bytes=0"
+              << " l0_tree_index_pool_bytes=0"
+              << " l0_tree_index_total_bytes=0"
+              << " l1_resident_total_estimated_bytes=0"
+              << " seg_bitmap_bytes=0"
+              << " seg_bitmap_history_bytes=0"
+              << " seg_bitmap_freed_bits_capacity_bytes=0"
+              << " seg_log_bitmap_bytes=0"
+              << " seg_log_bitmap_history_bytes=0"
+              << " seg_log_bitmap_freed_bits_capacity_bytes=0"
+              << " seg_cache_count=0"
+              << " seg_cache_queue_estimated_bytes=0"
+              << " seg_cache_segment_object_bytes=0"
+              << " seg_cache_segment_buffer_bytes=0"
+              << " seg_cache_segment_bitmap_bytes=0"
+              << " seg_cache_segment_bitmap_freed_bits_capacity_bytes=0"
+              << " seg_log_group_slot_bytes=0"
+              << " seg_total_estimated_bytes=0"
+              << " manifest_super_buffer_bytes=0"
+              << " manifest_super_meta_bytes=0"
+              << " manifest_batch_super_meta_bytes=0"
+              << " manifest_l0_freelist_estimated_bytes=0"
+              << " manifest_batch_pages_data_bytes=0"
+              << " manifest_batch_pages_map_node_estimated_bytes=0"
+              << " manifest_batch_pages_map_bucket_bytes=0"
+              << " manifest_total_estimated_bytes=0"
+              << " memtable_masstree_active_count=0"
+              << " memtable_masstree_tree_bytes=0"
+              << " memtable_masstree_pool_bytes=0"
+              << " memtable_masstree_total_bytes=0"
+              << " db_core_fixed_estimated_bytes=0"
+              << " total_known_resident_estimated_bytes=0"
+              << " alloc_supported=" << (alloc_before.supported ? 1 : 0)
+              << " alloc_before_backend=" << AllocatorBackendToken(alloc_before.backend)
+              << " alloc_before_backend_code="
+              << static_cast<uint64_t>(alloc_before.backend)
+              << " alloc_before_arena_bytes=" << alloc_before.arena_bytes
+              << " alloc_before_hblkhd_bytes=" << alloc_before.hblkhd_bytes
+              << " alloc_before_uordblks_bytes=" << alloc_before.uordblks_bytes
+              << " alloc_before_fordblks_bytes=" << alloc_before.fordblks_bytes
+              << " alloc_before_keepcost_bytes=" << alloc_before.keepcost_bytes
+              << " alloc_before_total_system_bytes=" << alloc_before.total_system_bytes
+              << " alloc_before_total_inuse_estimated_bytes="
+              << alloc_before.total_inuse_estimated_bytes
+              << " alloc_before_total_free_estimated_bytes="
+              << alloc_before.total_free_estimated_bytes
+              << " alloc_before_jemalloc_stats_valid="
+              << (alloc_before.jemalloc_stats_valid ? 1 : 0)
+              << " alloc_before_jemalloc_allocated_bytes="
+              << alloc_before.jemalloc_allocated_bytes
+              << " alloc_before_jemalloc_active_bytes="
+              << alloc_before.jemalloc_active_bytes
+              << " alloc_before_jemalloc_resident_bytes="
+              << alloc_before.jemalloc_resident_bytes
+              << " alloc_before_jemalloc_mapped_bytes="
+              << alloc_before.jemalloc_mapped_bytes
+              << " alloc_before_jemalloc_retained_bytes="
+              << alloc_before.jemalloc_retained_bytes
+              << " alloc_after_backend=" << AllocatorBackendToken(alloc_after.backend)
+              << " alloc_after_backend_code="
+              << static_cast<uint64_t>(alloc_after.backend)
+              << " alloc_after_arena_bytes=" << alloc_after.arena_bytes
+              << " alloc_after_hblkhd_bytes=" << alloc_after.hblkhd_bytes
+              << " alloc_after_uordblks_bytes=" << alloc_after.uordblks_bytes
+              << " alloc_after_fordblks_bytes=" << alloc_after.fordblks_bytes
+              << " alloc_after_keepcost_bytes=" << alloc_after.keepcost_bytes
+              << " alloc_after_total_system_bytes=" << alloc_after.total_system_bytes
+              << " alloc_after_total_inuse_estimated_bytes="
+              << alloc_after.total_inuse_estimated_bytes
+              << " alloc_after_total_free_estimated_bytes="
+              << alloc_after.total_free_estimated_bytes
+              << " alloc_after_jemalloc_stats_valid="
+              << (alloc_after.jemalloc_stats_valid ? 1 : 0)
+              << " alloc_after_jemalloc_allocated_bytes="
+              << alloc_after.jemalloc_allocated_bytes
+              << " alloc_after_jemalloc_active_bytes="
+              << alloc_after.jemalloc_active_bytes
+              << " alloc_after_jemalloc_resident_bytes="
+              << alloc_after.jemalloc_resident_bytes
+              << " alloc_after_jemalloc_mapped_bytes="
+              << alloc_after.jemalloc_mapped_bytes
+              << " alloc_after_jemalloc_retained_bytes="
+              << alloc_after.jemalloc_retained_bytes
+              << " has_pending_delta_batch=0"
+              << " pending_delta_prefix_count=0"
+              << " pending_delta_ops_count=0"
+              << " dump_malloc_info_called=" << (cfg.dump_malloc_info ? 1 : 0)
+              << " malloc_info_result=" << malloc_info_result
+              << " malloc_info_file=" << malloc_info_file
+              << " rss_after_malloc_trim_bytes=" << rss_after_trim
+              << " rss_malloc_trim_delta_bytes=" << rss_trim_delta
+              << " malloc_trim_called=" << (cfg.rss_trim_probe ? 1 : 0)
+              << " malloc_trim_result=" << trim_result
+              << "\n";
+}
+
 Config ParseArgs(int argc, char** argv) {
     Config cfg;
     for (int i = 1; i < argc; ++i) {
@@ -215,6 +586,26 @@ Config ParseArgs(int argc, char** argv) {
             cfg.use_direct_io = ParseBoolFlag(value);
         } else if (key == "--keep-db-files") {
             cfg.keep_db_files = ParseBoolFlag(value);
+        } else if (key == "--trace-manual-phases") {
+            cfg.trace_manual_phases = ParseBoolFlag(value);
+        } else if (key == "--trace-l1-resident") {
+            cfg.trace_l1_resident = ParseBoolFlag(value);
+        } else if (key == "--trace-allocator") {
+            cfg.trace_allocator = ParseBoolFlag(value);
+        } else if (key == "--dump-malloc-info") {
+            cfg.dump_malloc_info = ParseBoolFlag(value);
+        } else if (key == "--allocator-dump-dir") {
+            cfg.allocator_dump_dir = value;
+        } else if (key == "--rss-trim-probe") {
+            cfg.rss_trim_probe = ParseBoolFlag(value);
+        } else if (key == "--unbuffered-stdout") {
+            cfg.unbuffered_stdout = ParseBoolFlag(value);
+        } else if (key == "--probe-release-components") {
+            cfg.probe_release_components = ParseBoolFlag(value);
+        } else if (key == "--collect-put-latencies") {
+            cfg.collect_put_latencies = ParseBoolFlag(value);
+        } else if (key == "--trace-batch-events") {
+            cfg.trace_batch_events = ParseBoolFlag(value);
         } else {
             Fail("unknown argument: " + key);
         }
@@ -237,6 +628,9 @@ Config ParseArgs(int argc, char** argv) {
     }
     if (cfg.prefix_count > cfg.write_ops) {
         Fail("prefix_count must be <= write_ops");
+    }
+    if (cfg.dump_malloc_info && cfg.allocator_dump_dir.empty()) {
+        cfg.allocator_dump_dir = "allocator_snapshots";
     }
     return cfg;
 }
@@ -385,7 +779,9 @@ void InsertBatchParallel(const Config& cfg,
         workers.emplace_back([&, tid]() {
             auto client = db->GetClient(static_cast<int>(tid + 1));
             auto& lat = local_latencies[tid];
-            lat.reserve(op_count / worker_count + 1);
+            if (cfg.collect_put_latencies) {
+                lat.reserve(op_count / worker_count + 1);
+            }
             for (size_t i = logical_begin + tid; i < logical_end; i += worker_count) {
                 const KeyType key = KeyForLogicalIndex(cfg, dist, i);
                 const RoutePrefix prefix = ExtractPrefix(key);
@@ -393,12 +789,16 @@ void InsertBatchParallel(const Config& cfg,
                 KeySlice key_slice(key);
                 ValueSlice value_slice(DeterministicValue16(prefix, suffix));
 
-                const auto put_begin = std::chrono::steady_clock::now();
-                Check(client->Put(key_slice.slice, value_slice.slice), "Put should succeed");
-                const auto put_end = std::chrono::steady_clock::now();
-                lat.push_back(static_cast<uint64_t>(
-                    std::chrono::duration_cast<std::chrono::nanoseconds>(put_end - put_begin)
-                        .count()));
+                if (cfg.collect_put_latencies) {
+                    const auto put_begin = std::chrono::steady_clock::now();
+                    Check(client->Put(key_slice.slice, value_slice.slice), "Put should succeed");
+                    const auto put_end = std::chrono::steady_clock::now();
+                    lat.push_back(static_cast<uint64_t>(
+                        std::chrono::duration_cast<std::chrono::nanoseconds>(put_end - put_begin)
+                            .count()));
+                } else {
+                    Check(client->Put(key_slice.slice, value_slice.slice), "Put should succeed");
+                }
             }
         });
     }
@@ -406,11 +806,13 @@ void InsertBatchParallel(const Config& cfg,
     for (auto& t : workers) {
         t.join();
     }
-    for (auto& lat : local_latencies) {
-        put_latencies_ns->insert(
-            put_latencies_ns->end(),
-            std::make_move_iterator(lat.begin()),
-            std::make_move_iterator(lat.end()));
+    if (cfg.collect_put_latencies) {
+        for (auto& lat : local_latencies) {
+            put_latencies_ns->insert(
+                put_latencies_ns->end(),
+                std::make_move_iterator(lat.begin()),
+                std::make_move_iterator(lat.end()));
+        }
     }
 }
 
@@ -445,7 +847,9 @@ void InsertRangeParallelWithPersistentClients(
             Check(client != nullptr, "persistent client should not be null");
 
             auto& lat = local_latencies[tid];
-            lat.reserve(op_count / worker_count + 1);
+            if (cfg.collect_put_latencies) {
+                lat.reserve(op_count / worker_count + 1);
+            }
             for (size_t i = logical_begin + tid; i < logical_end; i += worker_count) {
                 const KeyType key = KeyForLogicalIndex(cfg, dist, i);
                 const RoutePrefix prefix = ExtractPrefix(key);
@@ -453,13 +857,18 @@ void InsertRangeParallelWithPersistentClients(
                 KeySlice key_slice(key);
                 ValueSlice value_slice(DeterministicValue16(prefix, suffix));
 
-                const auto put_begin = std::chrono::steady_clock::now();
-                const bool ok = client->Put(key_slice.slice, value_slice.slice);
-                Check(ok, "Put should succeed");
-                const auto put_end = std::chrono::steady_clock::now();
-                lat.push_back(static_cast<uint64_t>(
-                    std::chrono::duration_cast<std::chrono::nanoseconds>(put_end - put_begin)
-                        .count()));
+                if (cfg.collect_put_latencies) {
+                    const auto put_begin = std::chrono::steady_clock::now();
+                    const bool ok = client->Put(key_slice.slice, value_slice.slice);
+                    Check(ok, "Put should succeed");
+                    const auto put_end = std::chrono::steady_clock::now();
+                    lat.push_back(static_cast<uint64_t>(
+                        std::chrono::duration_cast<std::chrono::nanoseconds>(put_end - put_begin)
+                            .count()));
+                } else {
+                    const bool ok = client->Put(key_slice.slice, value_slice.slice);
+                    Check(ok, "Put should succeed");
+                }
             }
         });
     }
@@ -467,11 +876,13 @@ void InsertRangeParallelWithPersistentClients(
     for (auto& t : workers) {
         t.join();
     }
-    for (auto& lat : local_latencies) {
-        put_latencies_ns->insert(
-            put_latencies_ns->end(),
-            std::make_move_iterator(lat.begin()),
-            std::make_move_iterator(lat.end()));
+    if (cfg.collect_put_latencies) {
+        for (auto& lat : local_latencies) {
+            put_latencies_ns->insert(
+                put_latencies_ns->end(),
+                std::make_move_iterator(lat.begin()),
+                std::make_move_iterator(lat.end()));
+        }
     }
 }
 
@@ -490,7 +901,9 @@ WriteMetrics RunWriteWorkload(const Config& cfg, Distribution dist, const std::s
         cfg.compaction_threads > 0 ? cfg.compaction_threads : std::max<size_t>(4, cfg.threads);
     db_cfg.compaction_threads = effective_compaction_threads;
 
-    MYDB db(db_cfg);
+    WriteMetrics metrics;
+    auto db_holder = std::make_unique<MYDB>(db_cfg);
+    MYDB& db = *db_holder;
     if (maintenance_mode == MaintenanceMode::kManual) {
         db.StopBackgroundTriggerForTesting();
         db.SetCompactionEnabled(false);
@@ -501,7 +914,9 @@ WriteMetrics RunWriteWorkload(const Config& cfg, Distribution dist, const std::s
     db.SetL0WriteStallTreeNum(cfg.l0_write_stall_threshold);
 
     std::vector<uint64_t> put_latencies_ns;
-    put_latencies_ns.reserve(cfg.write_ops);
+    if (cfg.collect_put_latencies) {
+        put_latencies_ns.reserve(cfg.write_ops);
+    }
 
     uint64_t flush_count = 0;
     uint64_t compaction_count = 0;
@@ -537,37 +952,352 @@ WriteMetrics RunWriteWorkload(const Config& cfg, Distribution dist, const std::s
     double drain_wait_ms = 0.0;
     size_t rss_before_drain_wait_bytes = 0;
     size_t rss_after_drain_wait_bytes = 0;
+    uint64_t rss_after_malloc_trim_bytes = 0;
+    int64_t rss_malloc_trim_delta_bytes = 0;
+    uint64_t malloc_info_snapshot_seq = 0;
+
+    const auto emit_l1_resident_snapshot =
+        [&](const std::string& event, bool enable_trim_probe) {
+            if (!cfg.trace_manual_phases ||
+                (!cfg.trace_l1_resident && !cfg.trace_allocator && !cfg.dump_malloc_info)) {
+                return;
+            }
+            const uint64_t rss_bytes = static_cast<uint64_t>(GetProcessRSSBytes());
+            const auto engine_stats = db.DebugEstimateEngineResidentMemory();
+            const auto resident_stats = db.current_version_->DebugEstimateLevel1ResidentMemory();
+            const auto alloc_before = CaptureAllocatorSnapshot();
+
+            uint64_t rss_after_trim = rss_bytes;
+            int64_t rss_trim_delta = 0;
+            int trim_result = -1;
+            auto alloc_after = alloc_before;
+            std::string malloc_info_file = "-";
+            int malloc_info_result = -1;
+#if defined(__GLIBC__)
+            if (enable_trim_probe && cfg.rss_trim_probe) {
+                trim_result = malloc_trim(0);
+                rss_after_trim = static_cast<uint64_t>(GetProcessRSSBytes());
+                rss_trim_delta = static_cast<int64_t>(rss_after_trim) -
+                                 static_cast<int64_t>(rss_bytes);
+                rss_after_malloc_trim_bytes = rss_after_trim;
+                rss_malloc_trim_delta_bytes = rss_trim_delta;
+                alloc_after = CaptureAllocatorSnapshot();
+            }
+#endif
+            if (cfg.dump_malloc_info) {
+                const auto file_name =
+                    "malloc_info_" + std::to_string(++malloc_info_snapshot_seq) + "_" + event +
+                    ".xml";
+                const auto dump_path = std::filesystem::path(cfg.allocator_dump_dir) / file_name;
+                malloc_info_result = DumpMallocInfoSnapshot(dump_path);
+                malloc_info_file = dump_path.string();
+            }
+
+            std::cout << "[MANUAL_L1_RESIDENT]"
+                      << " event=" << event
+                      << " rss_bytes=" << rss_bytes
+                      << " l1_route_index_estimated_bytes="
+                      << engine_stats.l1_route_index_estimated_bytes
+                      << " l1_route_index_measured_bytes="
+                      << engine_stats.l1_route_index_measured_bytes
+                      << " l1_route_index_pool_bytes="
+                      << engine_stats.l1_route_index_pool_bytes
+                      << " l1_route_partition_bytes="
+                      << engine_stats.l1_route_partition_bytes
+                      << " l1_subtree_published_bytes="
+                      << engine_stats.l1_subtree_published_bytes
+                      << " l1_subtree_cache_bytes="
+                      << engine_stats.l1_subtree_cache_bytes
+                      << " l1_pending_changed_route_keys_bytes="
+                      << engine_stats.l1_pending_changed_route_keys_bytes
+                      << " l1_pending_delta_estimated_bytes="
+                      << engine_stats.l1_pending_delta_estimated_bytes
+                      << " l0_table_lists_total_size="
+                      << engine_stats.l0_table_lists_total_size
+                      << " l0_table_lists_total_capacity="
+                      << engine_stats.l0_table_lists_total_capacity
+                      << " l0_table_lists_total_capacity_bytes="
+                      << engine_stats.l0_table_lists_total_capacity_bytes
+                      << " l0_tree_index_count="
+                      << engine_stats.l0_tree_index_count
+                      << " l0_tree_index_tree_bytes="
+                      << engine_stats.l0_tree_index_tree_bytes
+                      << " l0_tree_index_pool_bytes="
+                      << engine_stats.l0_tree_index_pool_bytes
+                      << " l0_tree_index_total_bytes="
+                      << engine_stats.l0_tree_index_total_bytes
+                      << " l1_resident_total_estimated_bytes="
+                      << engine_stats.l1_total_estimated_bytes
+                      << " seg_bitmap_bytes=" << engine_stats.seg_bitmap_bytes
+                      << " seg_bitmap_history_bytes="
+                      << engine_stats.seg_bitmap_history_bytes
+                      << " seg_bitmap_freed_bits_capacity_bytes="
+                      << engine_stats.seg_bitmap_freed_bits_capacity_bytes
+                      << " seg_log_bitmap_bytes=" << engine_stats.seg_log_bitmap_bytes
+                      << " seg_log_bitmap_history_bytes="
+                      << engine_stats.seg_log_bitmap_history_bytes
+                      << " seg_log_bitmap_freed_bits_capacity_bytes="
+                      << engine_stats.seg_log_bitmap_freed_bits_capacity_bytes
+                      << " seg_cache_count=" << engine_stats.seg_cache_count
+                      << " seg_cache_queue_estimated_bytes="
+                      << engine_stats.seg_cache_queue_estimated_bytes
+                      << " seg_cache_segment_object_bytes="
+                      << engine_stats.seg_cache_segment_object_bytes
+                      << " seg_cache_segment_buffer_bytes="
+                      << engine_stats.seg_cache_segment_buffer_bytes
+                      << " seg_cache_segment_bitmap_bytes="
+                      << engine_stats.seg_cache_segment_bitmap_bytes
+                      << " seg_cache_segment_bitmap_freed_bits_capacity_bytes="
+                      << engine_stats.seg_cache_segment_bitmap_freed_bits_capacity_bytes
+                      << " seg_log_group_slot_bytes="
+                      << engine_stats.seg_log_group_slot_bytes
+                      << " seg_total_estimated_bytes="
+                      << engine_stats.seg_total_estimated_bytes
+                      << " manifest_super_buffer_bytes="
+                      << engine_stats.manifest_super_buffer_bytes
+                      << " manifest_super_meta_bytes="
+                      << engine_stats.manifest_super_meta_bytes
+                      << " manifest_batch_super_meta_bytes="
+                      << engine_stats.manifest_batch_super_meta_bytes
+                      << " manifest_l0_freelist_estimated_bytes="
+                      << engine_stats.manifest_l0_freelist_estimated_bytes
+                      << " manifest_batch_pages_data_bytes="
+                      << engine_stats.manifest_batch_pages_data_bytes
+                      << " manifest_batch_pages_map_node_estimated_bytes="
+                      << engine_stats.manifest_batch_pages_map_node_estimated_bytes
+                      << " manifest_batch_pages_map_bucket_bytes="
+                      << engine_stats.manifest_batch_pages_map_bucket_bytes
+                      << " manifest_total_estimated_bytes="
+                      << engine_stats.manifest_total_estimated_bytes
+                      << " memtable_masstree_active_count="
+                      << engine_stats.memtable_masstree_active_count
+                      << " memtable_masstree_tree_bytes="
+                      << engine_stats.memtable_masstree_tree_bytes
+                      << " memtable_masstree_pool_bytes="
+                      << engine_stats.memtable_masstree_pool_bytes
+                      << " memtable_masstree_total_bytes="
+                      << engine_stats.memtable_masstree_total_bytes
+                      << " db_core_fixed_estimated_bytes="
+                      << engine_stats.db_core_fixed_estimated_bytes
+                      << " total_known_resident_estimated_bytes="
+                      << engine_stats.total_known_resident_estimated_bytes
+                      << " alloc_supported=" << (alloc_before.supported ? 1 : 0)
+                      << " alloc_before_backend=" << AllocatorBackendToken(alloc_before.backend)
+                      << " alloc_before_backend_code="
+                      << static_cast<uint64_t>(alloc_before.backend)
+                      << " alloc_before_arena_bytes=" << alloc_before.arena_bytes
+                      << " alloc_before_hblkhd_bytes=" << alloc_before.hblkhd_bytes
+                      << " alloc_before_uordblks_bytes=" << alloc_before.uordblks_bytes
+                      << " alloc_before_fordblks_bytes=" << alloc_before.fordblks_bytes
+                      << " alloc_before_keepcost_bytes=" << alloc_before.keepcost_bytes
+                      << " alloc_before_total_system_bytes="
+                      << alloc_before.total_system_bytes
+                      << " alloc_before_total_inuse_estimated_bytes="
+                      << alloc_before.total_inuse_estimated_bytes
+                      << " alloc_before_total_free_estimated_bytes="
+                      << alloc_before.total_free_estimated_bytes
+                      << " alloc_before_jemalloc_stats_valid="
+                      << (alloc_before.jemalloc_stats_valid ? 1 : 0)
+                      << " alloc_before_jemalloc_allocated_bytes="
+                      << alloc_before.jemalloc_allocated_bytes
+                      << " alloc_before_jemalloc_active_bytes="
+                      << alloc_before.jemalloc_active_bytes
+                      << " alloc_before_jemalloc_resident_bytes="
+                      << alloc_before.jemalloc_resident_bytes
+                      << " alloc_before_jemalloc_mapped_bytes="
+                      << alloc_before.jemalloc_mapped_bytes
+                      << " alloc_before_jemalloc_retained_bytes="
+                      << alloc_before.jemalloc_retained_bytes
+                      << " alloc_after_backend=" << AllocatorBackendToken(alloc_after.backend)
+                      << " alloc_after_backend_code="
+                      << static_cast<uint64_t>(alloc_after.backend)
+                      << " alloc_after_arena_bytes=" << alloc_after.arena_bytes
+                      << " alloc_after_hblkhd_bytes=" << alloc_after.hblkhd_bytes
+                      << " alloc_after_uordblks_bytes=" << alloc_after.uordblks_bytes
+                      << " alloc_after_fordblks_bytes=" << alloc_after.fordblks_bytes
+                      << " alloc_after_keepcost_bytes=" << alloc_after.keepcost_bytes
+                      << " alloc_after_total_system_bytes="
+                      << alloc_after.total_system_bytes
+                      << " alloc_after_total_inuse_estimated_bytes="
+                      << alloc_after.total_inuse_estimated_bytes
+                      << " alloc_after_total_free_estimated_bytes="
+                      << alloc_after.total_free_estimated_bytes
+                      << " alloc_after_jemalloc_stats_valid="
+                      << (alloc_after.jemalloc_stats_valid ? 1 : 0)
+                      << " alloc_after_jemalloc_allocated_bytes="
+                      << alloc_after.jemalloc_allocated_bytes
+                      << " alloc_after_jemalloc_active_bytes="
+                      << alloc_after.jemalloc_active_bytes
+                      << " alloc_after_jemalloc_resident_bytes="
+                      << alloc_after.jemalloc_resident_bytes
+                      << " alloc_after_jemalloc_mapped_bytes="
+                      << alloc_after.jemalloc_mapped_bytes
+                      << " alloc_after_jemalloc_retained_bytes="
+                      << alloc_after.jemalloc_retained_bytes
+                      << " has_pending_delta_batch="
+                      << (resident_stats.has_pending_delta_batch ? 1 : 0)
+                      << " pending_delta_prefix_count="
+                      << resident_stats.pending_delta_prefix_count
+                      << " pending_delta_ops_count="
+                      << resident_stats.pending_delta_ops_count
+                      << " dump_malloc_info_called=" << (cfg.dump_malloc_info ? 1 : 0)
+                      << " malloc_info_result=" << malloc_info_result
+                      << " malloc_info_file=" << malloc_info_file
+                      << " rss_after_malloc_trim_bytes=" << rss_after_trim
+                      << " rss_malloc_trim_delta_bytes=" << rss_trim_delta
+                      << " malloc_trim_called="
+                      << ((enable_trim_probe && cfg.rss_trim_probe) ? 1 : 0)
+                      << " malloc_trim_result=" << trim_result
+                      << "\n";
+        };
+
+    auto trace_manual_event = [&](const std::string& event,
+                                  size_t batch_idx,
+                                  size_t logical_begin,
+                                  size_t logical_end,
+                                  double phase_time_ms,
+                                  bool compacted,
+                                  const flowkv::hybrid_l1::L1HybridRebuilder::IndexUpdateStats*
+                                      stats_snapshot) {
+        if (!cfg.trace_manual_phases) {
+            return;
+        }
+        const bool is_probe_event = event.rfind("probe_after_", 0) == 0;
+        const bool should_print_trace =
+            cfg.trace_batch_events || event == "run_start" || event == "post_wait" ||
+            is_probe_event;
+        const auto now = std::chrono::steady_clock::now();
+        const double elapsed_ms =
+            static_cast<double>(
+                std::chrono::duration_cast<std::chrono::microseconds>(now - total_begin).count()) /
+            1000.0;
+        const uint64_t rss_bytes = static_cast<uint64_t>(GetProcessRSSBytes());
+        if (should_print_trace) {
+            std::cout << "[MANUAL_TRACE]"
+                      << " t_ms=" << elapsed_ms
+                      << " event=" << event
+                      << " batch_idx=" << batch_idx
+                      << " logical_begin=" << logical_begin
+                      << " logical_end=" << logical_end
+                      << " phase_time_ms=" << phase_time_ms
+                      << " compacted=" << (compacted ? 1 : 0)
+                      << " rss_bytes=" << rss_bytes
+                      << " l0_tree_num=" << db.current_version_->GetLevel0TreeNum()
+                      << " l1_active_pst_count=" << db.current_version_->GetLevelSize(1);
+            if (stats_snapshot != nullptr) {
+                std::cout << " delta_prefix_count=" << stats_snapshot->delta_prefix_count
+                          << " delta_ops_count=" << stats_snapshot->delta_ops_count
+                          << " effective_delta_prefix_count="
+                          << stats_snapshot->effective_delta_prefix_count
+                          << " effective_delta_ops_count="
+                          << stats_snapshot->effective_delta_ops_count
+                          << " index_update_total_ms=" << stats_snapshot->index_update_total_ms
+                          << " index_update_cow_ms=" << stats_snapshot->index_update_cow_ms
+                          << " index_update_bulk_ms=" << stats_snapshot->index_update_bulk_ms
+                          << " cow_prefix_count=" << stats_snapshot->cow_prefix_count
+                          << " bulk_prefix_count=" << stats_snapshot->bulk_prefix_count;
+            }
+            std::cout << "\n";
+        }
+
+        if (event == "batch_compaction_end" ||
+            event == "drain_compaction_end") {
+            emit_l1_resident_snapshot(event, false);
+        } else if (event == "post_wait") {
+            emit_l1_resident_snapshot(event, true);
+        } else if (event.rfind("probe_after_", 0) == 0) {
+            emit_l1_resident_snapshot(event, false);
+        }
+    };
+
+    trace_manual_event("run_start", 0, 0, 0, 0.0, false, nullptr);
 
     if (maintenance_mode == MaintenanceMode::kManual) {
         for (size_t begin = 0; begin < cfg.write_ops; begin += cfg.flush_batch) {
             const size_t end = std::min(cfg.write_ops, begin + cfg.flush_batch);
+            const size_t batch_idx = begin / cfg.flush_batch;
+            trace_manual_event("batch_put_start", batch_idx, begin, end, 0.0, false, nullptr);
             const auto fg_begin = std::chrono::steady_clock::now();
             InsertBatchParallel(cfg, &db, dist, begin, end, &put_latencies_ns);
             const auto fg_end = std::chrono::steady_clock::now();
+            const double put_ms =
+                static_cast<double>(
+                    std::chrono::duration_cast<std::chrono::microseconds>(fg_end - fg_begin).count()) /
+                1000.0;
             foreground_elapsed_ns += static_cast<uint64_t>(
                 std::chrono::duration_cast<std::chrono::nanoseconds>(fg_end - fg_begin).count());
+            trace_manual_event("batch_put_end", batch_idx, begin, end, put_ms, false, nullptr);
+
+            trace_manual_event("batch_flush_start", batch_idx, begin, end, 0.0, false, nullptr);
             const auto flush_begin = std::chrono::steady_clock::now();
             Check(db.BGFlush(), "BGFlush should succeed during ingest");
             const auto flush_end = std::chrono::steady_clock::now();
+            const double flush_ms =
+                static_cast<double>(
+                    std::chrono::duration_cast<std::chrono::microseconds>(flush_end - flush_begin)
+                        .count()) /
+                1000.0;
             record_flush_metrics(flush_begin, flush_end);
+            trace_manual_event("batch_flush_end", batch_idx, begin, end, flush_ms, true, nullptr);
 
             while (db.current_version_->GetLevel0TreeNum() >=
                    static_cast<int>(cfg.l0_compaction_trigger)) {
+                trace_manual_event(
+                    "batch_compaction_start", batch_idx, begin, end, 0.0, false, nullptr);
                 const auto comp_begin = std::chrono::steady_clock::now();
                 const bool compacted = db.BGCompaction();
                 const auto comp_end = std::chrono::steady_clock::now();
+                const double comp_ms =
+                    static_cast<double>(
+                        std::chrono::duration_cast<std::chrono::microseconds>(comp_end - comp_begin)
+                            .count()) /
+                    1000.0;
                 if (!compacted) {
+                    trace_manual_event(
+                        "batch_compaction_skip", batch_idx, begin, end, comp_ms, false, nullptr);
                     break;
                 }
                 record_compaction_metrics(comp_begin, comp_end);
+                const auto stats_snapshot =
+                    flowkv::hybrid_l1::L1HybridRebuilder::GetIndexUpdateStats();
+                trace_manual_event(
+                    "batch_compaction_end",
+                    batch_idx,
+                    begin,
+                    end,
+                    comp_ms,
+                    true,
+                    &stats_snapshot);
             }
         }
 
+        const size_t drain_batch_idx = cfg.write_ops / cfg.flush_batch;
         while (db.current_version_->GetLevel0TreeNum() > 0) {
+            trace_manual_event(
+                "drain_compaction_start",
+                drain_batch_idx,
+                cfg.write_ops,
+                cfg.write_ops,
+                0.0,
+                false,
+                nullptr);
             const auto comp_begin = std::chrono::steady_clock::now();
             const bool compacted = db.BGCompaction();
             const auto comp_end = std::chrono::steady_clock::now();
+            const double comp_ms =
+                static_cast<double>(
+                    std::chrono::duration_cast<std::chrono::microseconds>(comp_end - comp_begin)
+                        .count()) /
+                1000.0;
             if (!compacted) {
+                trace_manual_event(
+                    "drain_compaction_skip",
+                    drain_batch_idx,
+                    cfg.write_ops,
+                    cfg.write_ops,
+                    comp_ms,
+                    false,
+                    nullptr);
                 db.WaitForFlushAndCompaction();
                 if (db.current_version_->GetLevel0TreeNum() > 0) {
                     std::this_thread::sleep_for(std::chrono::milliseconds(10));
@@ -575,6 +1305,16 @@ WriteMetrics RunWriteWorkload(const Config& cfg, Distribution dist, const std::s
                 continue;
             }
             record_compaction_metrics(comp_begin, comp_end);
+            const auto stats_snapshot =
+                flowkv::hybrid_l1::L1HybridRebuilder::GetIndexUpdateStats();
+            trace_manual_event(
+                "drain_compaction_end",
+                drain_batch_idx,
+                cfg.write_ops,
+                cfg.write_ops,
+                comp_ms,
+                true,
+                &stats_snapshot);
         }
     } else {
         // Align with FlowKV native benchmark: foreground put threads run continuously
@@ -601,6 +1341,100 @@ WriteMetrics RunWriteWorkload(const Config& cfg, Distribution dist, const std::s
             std::chrono::duration_cast<std::chrono::microseconds>(wait_end - wait_begin).count()) /
         1000.0;
     rss_after_drain_wait_bytes = GetProcessRSSBytes();
+    trace_manual_event(
+        "post_wait",
+        cfg.write_ops / cfg.flush_batch,
+        cfg.write_ops,
+        cfg.write_ops,
+        drain_wait_ms,
+        true,
+        nullptr);
+
+    if (cfg.probe_release_components && cfg.trace_manual_phases) {
+        const uint64_t released_l0_lists_est =
+            static_cast<uint64_t>(db.DebugReleaseLevel0TableListCapacityForProbe());
+        std::cout << "[MANUAL_PROBE]"
+                  << " event=release_l0_table_lists"
+                  << " released_estimated_bytes=" << released_l0_lists_est << "\n";
+        trace_manual_event(
+            "probe_after_release_l0_table_lists",
+            cfg.write_ops / cfg.flush_batch,
+            cfg.write_ops,
+            cfg.write_ops,
+            0.0,
+            true,
+            nullptr);
+
+        const uint64_t released_seg_cache_est =
+            static_cast<uint64_t>(db.DebugReleaseSegmentCacheForProbe());
+        std::cout << "[MANUAL_PROBE]"
+                  << " event=release_segment_cache"
+                  << " released_estimated_bytes=" << released_seg_cache_est << "\n";
+        trace_manual_event(
+            "probe_after_release_segment_cache",
+            cfg.write_ops / cfg.flush_batch,
+            cfg.write_ops,
+            cfg.write_ops,
+            0.0,
+            true,
+            nullptr);
+
+        const uint64_t released_l1_all_est =
+            static_cast<uint64_t>(db.DebugReleaseAllLevel1ForProbe());
+        std::cout << "[MANUAL_PROBE]"
+                  << " event=release_l1_all"
+                  << " released_estimated_bytes=" << released_l1_all_est << "\n";
+        trace_manual_event(
+            "probe_after_release_l1_all",
+            cfg.write_ops / cfg.flush_batch,
+            cfg.write_ops,
+            cfg.write_ops,
+            0.0,
+            true,
+            nullptr);
+
+        const uint64_t released_manifest_est =
+            static_cast<uint64_t>(db.DebugReleaseManifestStateForProbe());
+        std::cout << "[MANUAL_PROBE]"
+                  << " event=release_manifest_state"
+                  << " released_estimated_bytes=" << released_manifest_est << "\n";
+        trace_manual_event(
+            "probe_after_release_manifest_state",
+            cfg.write_ops / cfg.flush_batch,
+            cfg.write_ops,
+            cfg.write_ops,
+            0.0,
+            true,
+            nullptr);
+
+        const uint64_t released_memtable_est =
+            static_cast<uint64_t>(db.DebugReleaseActiveMemtableForProbe());
+        std::cout << "[MANUAL_PROBE]"
+                  << " event=release_active_memtable"
+                  << " released_estimated_bytes=" << released_memtable_est << "\n";
+        trace_manual_event(
+            "probe_after_release_active_memtable",
+            cfg.write_ops / cfg.flush_batch,
+            cfg.write_ops,
+            cfg.write_ops,
+            0.0,
+            true,
+            nullptr);
+
+        const uint64_t released_thread_pools_est =
+            static_cast<uint64_t>(db.DebugReleaseThreadPoolsForProbe());
+        std::cout << "[MANUAL_PROBE]"
+                  << " event=release_thread_pools"
+                  << " released_estimated_bytes=" << released_thread_pools_est << "\n";
+        trace_manual_event(
+            "probe_after_release_thread_pools",
+            cfg.write_ops / cfg.flush_batch,
+            cfg.write_ops,
+            cfg.write_ops,
+            0.0,
+            true,
+            nullptr);
+    }
 
     if (maintenance_mode == MaintenanceMode::kBackground) {
         // In background mode, wait time includes mixed drain cost (flush + compaction + scheduler jitter).
@@ -616,20 +1450,25 @@ WriteMetrics RunWriteWorkload(const Config& cfg, Distribution dist, const std::s
                                   total_end - total_begin)
                                   .count());
 
-    Check(!put_latencies_ns.empty(), "no put latencies recorded");
-    std::sort(put_latencies_ns.begin(), put_latencies_ns.end());
-    const size_t p99_idx = std::min<size_t>(
-        put_latencies_ns.size() - 1, static_cast<size_t>(put_latencies_ns.size() * 0.99));
-    const uint64_t sum_put_ns = std::accumulate(
-        put_latencies_ns.begin(), put_latencies_ns.end(), static_cast<uint64_t>(0));
+    uint64_t p99_put_latency_ns = 0;
+    double avg_put_latency_ns = 0.0;
+    if (cfg.collect_put_latencies) {
+        Check(!put_latencies_ns.empty(), "no put latencies recorded");
+        std::sort(put_latencies_ns.begin(), put_latencies_ns.end());
+        const size_t p99_idx = std::min<size_t>(
+            put_latencies_ns.size() - 1, static_cast<size_t>(put_latencies_ns.size() * 0.99));
+        const uint64_t sum_put_ns = std::accumulate(
+            put_latencies_ns.begin(), put_latencies_ns.end(), static_cast<uint64_t>(0));
+        avg_put_latency_ns =
+            static_cast<double>(sum_put_ns) / static_cast<double>(put_latencies_ns.size());
+        p99_put_latency_ns = put_latencies_ns[p99_idx];
+    }
 
-    WriteMetrics metrics;
     metrics.write_ops = cfg.write_ops;
     metrics.flush_threads_effective = effective_flush_threads;
     metrics.compaction_threads_effective = effective_compaction_threads;
-    metrics.avg_put_latency_ns =
-        static_cast<double>(sum_put_ns) / static_cast<double>(put_latencies_ns.size());
-    metrics.p99_put_latency_ns = put_latencies_ns[p99_idx];
+    metrics.avg_put_latency_ns = avg_put_latency_ns;
+    metrics.p99_put_latency_ns = p99_put_latency_ns;
     metrics.total_ingest_time_ms = total_elapsed_ns / 1000000ULL;
     metrics.foreground_put_phase_time_ms = foreground_elapsed_ns / 1000000ULL;
     metrics.drain_wait_time_ms = drain_wait_ms;
@@ -665,11 +1504,80 @@ WriteMetrics RunWriteWorkload(const Config& cfg, Distribution dist, const std::s
     metrics.rss_drain_wait_delta_bytes =
         static_cast<int64_t>(rss_after_drain_wait_bytes) -
         static_cast<int64_t>(rss_before_drain_wait_bytes);
+    metrics.rss_after_malloc_trim_bytes =
+        rss_after_malloc_trim_bytes == 0 ? metrics.rss_after_drain_wait_bytes
+                                         : rss_after_malloc_trim_bytes;
+    metrics.rss_malloc_trim_delta_bytes =
+        rss_after_malloc_trim_bytes == 0 ? 0 : rss_malloc_trim_delta_bytes;
+    const auto allocator_snapshot = CaptureAllocatorSnapshot();
+    metrics.alloc_supported = allocator_snapshot.supported ? 1 : 0;
+    metrics.alloc_backend = static_cast<uint64_t>(allocator_snapshot.backend);
+    metrics.alloc_arena_bytes = allocator_snapshot.arena_bytes;
+    metrics.alloc_hblkhd_bytes = allocator_snapshot.hblkhd_bytes;
+    metrics.alloc_uordblks_bytes = allocator_snapshot.uordblks_bytes;
+    metrics.alloc_fordblks_bytes = allocator_snapshot.fordblks_bytes;
+    metrics.alloc_keepcost_bytes = allocator_snapshot.keepcost_bytes;
+    metrics.alloc_total_system_bytes = allocator_snapshot.total_system_bytes;
+    metrics.alloc_total_inuse_estimated_bytes =
+        allocator_snapshot.total_inuse_estimated_bytes;
+    metrics.alloc_total_free_estimated_bytes =
+        allocator_snapshot.total_free_estimated_bytes;
+    metrics.alloc_jemalloc_stats_valid = allocator_snapshot.jemalloc_stats_valid ? 1 : 0;
+    metrics.alloc_jemalloc_allocated_bytes = allocator_snapshot.jemalloc_allocated_bytes;
+    metrics.alloc_jemalloc_active_bytes = allocator_snapshot.jemalloc_active_bytes;
+    metrics.alloc_jemalloc_resident_bytes = allocator_snapshot.jemalloc_resident_bytes;
+    metrics.alloc_jemalloc_mapped_bytes = allocator_snapshot.jemalloc_mapped_bytes;
+    metrics.alloc_jemalloc_retained_bytes = allocator_snapshot.jemalloc_retained_bytes;
     // Backward-compatibility: rss_bytes keeps the "after drain" meaning.
     metrics.rss_bytes = metrics.rss_after_drain_wait_bytes;
 
     const auto l1_memory = db.current_version_->DebugEstimateLevel1MemoryUsage();
-    metrics.l1_route_index_measured_bytes = l1_memory.route_index_measured_bytes;
+    const auto resident_stats = db.current_version_->DebugEstimateLevel1ResidentMemory();
+    const auto engine_stats = db.DebugEstimateEngineResidentMemory();
+    metrics.l1_route_index_estimated_bytes = engine_stats.l1_route_index_estimated_bytes;
+    metrics.l1_route_index_measured_bytes = engine_stats.l1_route_index_measured_bytes;
+    metrics.l1_route_partition_bytes = engine_stats.l1_route_partition_bytes;
+    metrics.l1_subtree_published_bytes = engine_stats.l1_subtree_published_bytes;
+    metrics.l1_pending_changed_route_keys_bytes =
+        engine_stats.l1_pending_changed_route_keys_bytes;
+    metrics.l1_pending_delta_estimated_bytes = engine_stats.l1_pending_delta_estimated_bytes;
+    metrics.l0_tree_index_count = engine_stats.l0_tree_index_count;
+    metrics.l0_tree_index_tree_bytes = engine_stats.l0_tree_index_tree_bytes;
+    metrics.l0_tree_index_pool_bytes = engine_stats.l0_tree_index_pool_bytes;
+    metrics.l0_tree_index_total_bytes = engine_stats.l0_tree_index_total_bytes;
+    metrics.l1_resident_total_estimated_bytes = engine_stats.l1_total_estimated_bytes;
+    metrics.seg_bitmap_bytes = engine_stats.seg_bitmap_bytes;
+    metrics.seg_bitmap_history_bytes = engine_stats.seg_bitmap_history_bytes;
+    metrics.seg_bitmap_freed_bits_capacity_bytes =
+        engine_stats.seg_bitmap_freed_bits_capacity_bytes;
+    metrics.seg_log_bitmap_bytes = engine_stats.seg_log_bitmap_bytes;
+    metrics.seg_log_bitmap_history_bytes = engine_stats.seg_log_bitmap_history_bytes;
+    metrics.seg_log_bitmap_freed_bits_capacity_bytes =
+        engine_stats.seg_log_bitmap_freed_bits_capacity_bytes;
+    metrics.seg_cache_count = engine_stats.seg_cache_count;
+    metrics.seg_cache_queue_estimated_bytes = engine_stats.seg_cache_queue_estimated_bytes;
+    metrics.seg_cache_segment_object_bytes =
+        engine_stats.seg_cache_segment_object_bytes;
+    metrics.seg_cache_segment_buffer_bytes =
+        engine_stats.seg_cache_segment_buffer_bytes;
+    metrics.seg_cache_segment_bitmap_bytes =
+        engine_stats.seg_cache_segment_bitmap_bytes;
+    metrics.seg_log_group_slot_bytes = engine_stats.seg_log_group_slot_bytes;
+    metrics.seg_total_estimated_bytes = engine_stats.seg_total_estimated_bytes;
+    metrics.manifest_super_buffer_bytes = engine_stats.manifest_super_buffer_bytes;
+    metrics.manifest_super_meta_bytes = engine_stats.manifest_super_meta_bytes;
+    metrics.manifest_batch_super_meta_bytes = engine_stats.manifest_batch_super_meta_bytes;
+    metrics.manifest_l0_freelist_estimated_bytes =
+        engine_stats.manifest_l0_freelist_estimated_bytes;
+    metrics.manifest_batch_pages_data_bytes = engine_stats.manifest_batch_pages_data_bytes;
+    metrics.manifest_batch_pages_map_node_estimated_bytes =
+        engine_stats.manifest_batch_pages_map_node_estimated_bytes;
+    metrics.manifest_batch_pages_map_bucket_bytes =
+        engine_stats.manifest_batch_pages_map_bucket_bytes;
+    metrics.manifest_total_estimated_bytes = engine_stats.manifest_total_estimated_bytes;
+    metrics.db_core_fixed_estimated_bytes = engine_stats.db_core_fixed_estimated_bytes;
+    metrics.total_known_resident_estimated_bytes =
+        engine_stats.total_known_resident_estimated_bytes;
     metrics.l1_active_pst_count = static_cast<uint64_t>(db.current_version_->GetLevelSize(1));
     metrics.l0_tree_count_after_drain = static_cast<uint64_t>(db.current_version_->GetLevel0TreeNum());
     metrics.l1_subtree_cache_bytes = l1_memory.subtree_cache_bytes;
@@ -711,6 +1619,18 @@ WriteMetrics RunWriteWorkload(const Config& cfg, Distribution dist, const std::s
     metrics.tiny_hit_ratio = index_update_stats.tiny_hit_ratio;
     metrics.dirty_pack_pages = index_update_stats.dirty_pack_pages;
     metrics.pack_write_bytes = index_update_stats.pack_write_bytes;
+
+    if (cfg.probe_release_components && cfg.trace_manual_phases) {
+        db.WaitForFlushAndCompaction();
+        db_holder.reset();
+        EmitProcessOnlyResidentSnapshot(
+            cfg,
+            "probe_after_db_destroy",
+            total_begin,
+            cfg.write_ops / cfg.flush_batch,
+            &malloc_info_snapshot_seq);
+    }
+
     return metrics;
 }
 
@@ -728,6 +1648,16 @@ void PrintMetrics(const Config& cfg, const WriteMetrics& metrics) {
     std::cout << "l0_compaction_trigger=" << cfg.l0_compaction_trigger << "\n";
     std::cout << "l0_write_stall_threshold=" << cfg.l0_write_stall_threshold << "\n";
     std::cout << "use_direct_io=" << (cfg.use_direct_io ? 1 : 0) << "\n";
+    std::cout << "trace_manual_phases=" << (cfg.trace_manual_phases ? 1 : 0) << "\n";
+    std::cout << "trace_l1_resident=" << (cfg.trace_l1_resident ? 1 : 0) << "\n";
+    std::cout << "trace_allocator=" << (cfg.trace_allocator ? 1 : 0) << "\n";
+    std::cout << "dump_malloc_info=" << (cfg.dump_malloc_info ? 1 : 0) << "\n";
+    std::cout << "allocator_dump_dir=" << cfg.allocator_dump_dir << "\n";
+    std::cout << "rss_trim_probe=" << (cfg.rss_trim_probe ? 1 : 0) << "\n";
+    std::cout << "unbuffered_stdout=" << (cfg.unbuffered_stdout ? 1 : 0) << "\n";
+    std::cout << "probe_release_components=" << (cfg.probe_release_components ? 1 : 0) << "\n";
+    std::cout << "collect_put_latencies=" << (cfg.collect_put_latencies ? 1 : 0) << "\n";
+    std::cout << "trace_batch_events=" << (cfg.trace_batch_events ? 1 : 0) << "\n";
     std::cout << "avg_put_latency_ns=" << metrics.avg_put_latency_ns << "\n";
     std::cout << "p99_put_latency_ns=" << metrics.p99_put_latency_ns << "\n";
     std::cout << "put_path_throughput_ops=" << metrics.put_path_throughput_ops << "\n";
@@ -750,7 +1680,89 @@ void PrintMetrics(const Config& cfg, const WriteMetrics& metrics) {
     std::cout << "rss_before_drain_wait_bytes=" << metrics.rss_before_drain_wait_bytes << "\n";
     std::cout << "rss_after_drain_wait_bytes=" << metrics.rss_after_drain_wait_bytes << "\n";
     std::cout << "rss_drain_wait_delta_bytes=" << metrics.rss_drain_wait_delta_bytes << "\n";
+    std::cout << "rss_after_malloc_trim_bytes=" << metrics.rss_after_malloc_trim_bytes << "\n";
+    std::cout << "rss_malloc_trim_delta_bytes=" << metrics.rss_malloc_trim_delta_bytes << "\n";
+    std::cout << "alloc_supported=" << metrics.alloc_supported << "\n";
+    std::cout << "alloc_backend_code=" << metrics.alloc_backend << "\n";
+    std::cout << "alloc_backend="
+              << AllocatorBackendToken(static_cast<AllocatorBackend>(metrics.alloc_backend))
+              << "\n";
+    std::cout << "alloc_arena_bytes=" << metrics.alloc_arena_bytes << "\n";
+    std::cout << "alloc_hblkhd_bytes=" << metrics.alloc_hblkhd_bytes << "\n";
+    std::cout << "alloc_uordblks_bytes=" << metrics.alloc_uordblks_bytes << "\n";
+    std::cout << "alloc_fordblks_bytes=" << metrics.alloc_fordblks_bytes << "\n";
+    std::cout << "alloc_keepcost_bytes=" << metrics.alloc_keepcost_bytes << "\n";
+    std::cout << "alloc_total_system_bytes=" << metrics.alloc_total_system_bytes << "\n";
+    std::cout << "alloc_total_inuse_estimated_bytes="
+              << metrics.alloc_total_inuse_estimated_bytes << "\n";
+    std::cout << "alloc_total_free_estimated_bytes="
+              << metrics.alloc_total_free_estimated_bytes << "\n";
+    std::cout << "alloc_jemalloc_stats_valid=" << metrics.alloc_jemalloc_stats_valid << "\n";
+    std::cout << "alloc_jemalloc_allocated_bytes="
+              << metrics.alloc_jemalloc_allocated_bytes << "\n";
+    std::cout << "alloc_jemalloc_active_bytes="
+              << metrics.alloc_jemalloc_active_bytes << "\n";
+    std::cout << "alloc_jemalloc_resident_bytes="
+              << metrics.alloc_jemalloc_resident_bytes << "\n";
+    std::cout << "alloc_jemalloc_mapped_bytes="
+              << metrics.alloc_jemalloc_mapped_bytes << "\n";
+    std::cout << "alloc_jemalloc_retained_bytes="
+              << metrics.alloc_jemalloc_retained_bytes << "\n";
+    std::cout << "l1_route_index_estimated_bytes="
+              << metrics.l1_route_index_estimated_bytes << "\n";
     std::cout << "l1_route_index_measured_bytes=" << metrics.l1_route_index_measured_bytes << "\n";
+    std::cout << "l1_route_partition_bytes=" << metrics.l1_route_partition_bytes << "\n";
+    std::cout << "l1_subtree_published_bytes=" << metrics.l1_subtree_published_bytes << "\n";
+    std::cout << "l1_pending_changed_route_keys_bytes="
+              << metrics.l1_pending_changed_route_keys_bytes << "\n";
+    std::cout << "l1_pending_delta_estimated_bytes="
+              << metrics.l1_pending_delta_estimated_bytes << "\n";
+    std::cout << "l0_tree_index_count=" << metrics.l0_tree_index_count << "\n";
+    std::cout << "l0_tree_index_tree_bytes=" << metrics.l0_tree_index_tree_bytes << "\n";
+    std::cout << "l0_tree_index_pool_bytes=" << metrics.l0_tree_index_pool_bytes << "\n";
+    std::cout << "l0_tree_index_total_bytes=" << metrics.l0_tree_index_total_bytes << "\n";
+    std::cout << "l1_resident_total_estimated_bytes="
+              << metrics.l1_resident_total_estimated_bytes << "\n";
+    std::cout << "seg_bitmap_bytes=" << metrics.seg_bitmap_bytes << "\n";
+    std::cout << "seg_bitmap_history_bytes=" << metrics.seg_bitmap_history_bytes << "\n";
+    std::cout << "seg_bitmap_freed_bits_capacity_bytes="
+              << metrics.seg_bitmap_freed_bits_capacity_bytes << "\n";
+    std::cout << "seg_log_bitmap_bytes=" << metrics.seg_log_bitmap_bytes << "\n";
+    std::cout << "seg_log_bitmap_history_bytes="
+              << metrics.seg_log_bitmap_history_bytes << "\n";
+    std::cout << "seg_log_bitmap_freed_bits_capacity_bytes="
+              << metrics.seg_log_bitmap_freed_bits_capacity_bytes << "\n";
+    std::cout << "seg_cache_count=" << metrics.seg_cache_count << "\n";
+    std::cout << "seg_cache_queue_estimated_bytes="
+              << metrics.seg_cache_queue_estimated_bytes << "\n";
+    std::cout << "seg_cache_segment_object_bytes="
+              << metrics.seg_cache_segment_object_bytes << "\n";
+    std::cout << "seg_cache_segment_buffer_bytes="
+              << metrics.seg_cache_segment_buffer_bytes << "\n";
+    std::cout << "seg_cache_segment_bitmap_bytes="
+              << metrics.seg_cache_segment_bitmap_bytes << "\n";
+    std::cout << "seg_log_group_slot_bytes=" << metrics.seg_log_group_slot_bytes << "\n";
+    std::cout << "seg_total_estimated_bytes=" << metrics.seg_total_estimated_bytes << "\n";
+    std::cout << "manifest_super_buffer_bytes="
+              << metrics.manifest_super_buffer_bytes << "\n";
+    std::cout << "manifest_super_meta_bytes="
+              << metrics.manifest_super_meta_bytes << "\n";
+    std::cout << "manifest_batch_super_meta_bytes="
+              << metrics.manifest_batch_super_meta_bytes << "\n";
+    std::cout << "manifest_l0_freelist_estimated_bytes="
+              << metrics.manifest_l0_freelist_estimated_bytes << "\n";
+    std::cout << "manifest_batch_pages_data_bytes="
+              << metrics.manifest_batch_pages_data_bytes << "\n";
+    std::cout << "manifest_batch_pages_map_node_estimated_bytes="
+              << metrics.manifest_batch_pages_map_node_estimated_bytes << "\n";
+    std::cout << "manifest_batch_pages_map_bucket_bytes="
+              << metrics.manifest_batch_pages_map_bucket_bytes << "\n";
+    std::cout << "manifest_total_estimated_bytes="
+              << metrics.manifest_total_estimated_bytes << "\n";
+    std::cout << "db_core_fixed_estimated_bytes="
+              << metrics.db_core_fixed_estimated_bytes << "\n";
+    std::cout << "total_known_resident_estimated_bytes="
+              << metrics.total_known_resident_estimated_bytes << "\n";
     std::cout << "l1_active_pst_count=" << metrics.l1_active_pst_count << "\n";
     std::cout << "l0_tree_count_after_drain=" << metrics.l0_tree_count_after_drain << "\n";
     std::cout << "l1_subtree_cache_bytes=" << metrics.l1_subtree_cache_bytes << "\n";
@@ -790,6 +1802,10 @@ int main(int argc, char** argv) {
 #endif
 
     const Config cfg = ParseArgs(argc, argv);
+    if (cfg.unbuffered_stdout) {
+        std::cout.setf(std::ios::unitbuf);
+        std::cerr.setf(std::ios::unitbuf);
+    }
     const Distribution dist = ParseDistribution(cfg.distribution);
 
     std::filesystem::create_directories(cfg.db_dir);
